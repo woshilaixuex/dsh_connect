@@ -1,0 +1,37 @@
+# ---------- 本地配置与密钥(绝不提交) ----------
+.env
+.env.*
+!.env.example
+*.local
+dsh-connect.config.json
+
+# ---------- 依赖 ----------
+node_modules/
+
+# ---------- 构建产物 ----------
+lib/
+dist/
+*.tsbuildinfo
+
+# ---------- 本地日志与数据 ----------
+logs/
+*.log
+*.sqlite
+*.sqlite3
+
+# ---------- 本地工具目录 ----------
+.commandcode/
+.agents/
+
+# ---------- 测试临时产物 ----------
+coverage/
+.tmp*/
+
+# ---------- 系统与编辑器 ----------
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json

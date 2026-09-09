@@ -1,0 +1,7 @@
+allowBuilds:
+  esbuild: true
+# @deepseek-ai/dsh-type-meta is a peer of @deepseek-ai/dsh-session but is not
+# published to npm; the override resolves it to a published package so pnpm
+# install works. Nothing in this project imports it directly.
+overrides:
+  "@deepseek-ai/dsh-type-meta": "npm:@deepseek-ai/dsh-invariants@0.0.1-rc.1"
