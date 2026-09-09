@@ -20,13 +20,18 @@ export interface Config {
   logLevel: LogLevel
   /** 日志信息记录，DEV和DEBUG都会做持久化 */
   logPath?: string
+  /**
+   * SQLite 数据库文件路径。
+   * undefined = 用默认位置(dsh home 下);空串 = 不启用;相对路径基于 dsh home;绝对路径原样。
+   */
+  dbPath?: string
 }
 /**
  * 默认配置，做配置加载降级兜底
  */
 export const DEFAULT_CONFIG: Config = {
   hostName: '0.0.0.0',
-  listenPort: 8080,
+  listenPort: 8097,
   logLevel: LogLevel.DEV,
 }
 
@@ -116,6 +121,9 @@ function readEnv(): Partial<Config> {
   if (logLevel) env.logLevel = parseLogLevel(logLevel)
   const logPath = process.env[`${ENV_PREFIX}LOG_PATH`]
   if (logPath) env.logPath = logPath
+  const dbPath = process.env[`${ENV_PREFIX}DB_PATH`]
+  // dbPath 空串也生效(语义:禁用 SQLite),区别于其它字段的「非空才覆盖」
+  if (dbPath !== undefined) env.dbPath = dbPath
   return env
 }
 

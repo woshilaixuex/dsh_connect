@@ -18,8 +18,8 @@ import {
 
 const ENV_KEYS = [
   'DSH_CONNECT_HOST', 'DSH_CONNECT_HOSTNAME', 'DSH_CONNECT_PORT',
-  'DSH_CONNECT_LOG_LEVEL', 'DSH_CONNECT_LOG_PATH', 'DSH_CONNECT_CONFIG',
-  'DSH_CONNECT_DOTENV',
+  'DSH_CONNECT_LOG_LEVEL', 'DSH_CONNECT_LOG_PATH', 'DSH_CONNECT_DB_PATH',
+  'DSH_CONNECT_CONFIG', 'DSH_CONNECT_DOTENV',
 ]
 
 function clearEnv(): void {
@@ -36,7 +36,7 @@ beforeEach(() => {
 describe('DEFAULT_CONFIG', () => {
   test('提供合理的默认值', () => {
     assert.equal(DEFAULT_CONFIG.hostName, '0.0.0.0')
-    assert.equal(DEFAULT_CONFIG.listenPort, 8080)
+    assert.equal(DEFAULT_CONFIG.listenPort, 8097)
     assert.equal(DEFAULT_CONFIG.logLevel, LogLevel.DEV)
   })
 })
@@ -83,6 +83,16 @@ describe('环境变量解析', () => {
   test('非法 logLevel 回退默认值', () => {
     process.env.DSH_CONNECT_LOG_LEVEL = 'verbose'
     assert.equal(getConfig().logLevel, DEFAULT_CONFIG.logLevel)
+  })
+
+  test('DSH_CONNECT_DB_PATH 覆盖 dbPath(相对路径原文透传)', () => {
+    process.env.DSH_CONNECT_DB_PATH = 'var/data.db'
+    assert.equal(getConfig().dbPath, 'var/data.db')
+  })
+
+  test('DSH_CONNECT_DB_PATH 空串表示禁用 SQLite', () => {
+    process.env.DSH_CONNECT_DB_PATH = ''
+    assert.equal(getConfig().dbPath, '')
   })
 })
 
