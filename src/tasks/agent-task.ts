@@ -13,11 +13,11 @@
  */
 
 import { TaskError, type ConnectionHandle, type Hub, type LoggerLike, type RecvCtx } from '../hub/hub.js'
-import { ErrorCodes, type JsonValue } from '../protocol/frame.js'
+import { ErrorCodes, taskTopic, type JsonValue } from '../protocol/frame.js'
 import {
   buildUserMessage,
   detectAgentAdapter,
-  newSessionId,
+  newTaskId,
   type AgentRunAdapter,
   type AgentTaskHandle,
   type HostCtx,
@@ -43,13 +43,26 @@ interface ActiveTask {
   chunks: boolean
   stopRequested: boolean
   settled: boolean
+  /** 宿主回推的最后一条 agent/error(用于把最终 status 标成 failed)。 */
+  lastError?: string
   offs: (() => void)[]
+}
+
+/** registerAgentTask 的可选模型路由配置(缺省时回退宿主默认模型)。 */
+export interface AgentTaskOptions {
+  provider?: string
+  model?: string
 }
 
 /**
  * 注册 agent 任务接收器。返回注销函数(同时注销两个接收码)。
  */
-export function registerAgentTask(ctx: HostCtx, hub: Hub, logger: LoggerLike): () => void {
+export function registerAgentTask(
+  ctx: HostCtx,
+  hub: Hub,
+  logger: LoggerLike,
+  options: AgentTaskOptions = {},
+): () => void {
   const adapter = detectAgentAdapter(ctx)
   if (adapter) {
     logger.info('host agent service detected: %s', adapter.kind)
@@ -138,12 +151,12 @@ export function registerAgentTask(ctx: HostCtx, hub: Hub, logger: LoggerLike): (
     const cwd = typeof payload.cwd === 'string' ? payload.cwd : undefined
     const chunks = payload.chunks === true
 
-    const taskId = newSessionId()
+    const taskId = newTaskId()
     const task: ActiveTask = {
       taskId,
       conn,
       adapter,
-      channel: `task:${taskId}`,
+      channel: taskTopic(taskId),
       startedAt: Date.now(),
       chunks,
       stopRequested: false,
@@ -180,9 +193,11 @@ export function registerAgentTask(ctx: HostCtx, hub: Hub, logger: LoggerLike): (
       const info = isRecord(arg) ? arg : {}
       const agent = isRecord(info.agent) ? info.agent : undefined
       if (agent && agent.id === task.taskId) {
+        const message = errorMessage(info.error)
+        task.lastError = message
         hub.publish(task.channel, {
           kind: 'agent.error',
-          message: errorMessage(info.error),
+          message,
         } as unknown as JsonValue)
       }
     }
@@ -197,7 +212,12 @@ export function registerAgentTask(ctx: HostCtx, hub: Hub, logger: LoggerLike): (
 
     let handle: AgentTaskHandle
     try {
-      handle = await task.adapter.start({ sessionId: task.taskId, prompt, cwd })
+      handle = await task.adapter.create({
+        sessionId: task.taskId,
+        cwd,
+        provider: options.provider,
+        model: options.model,
+      })
     } catch (error) {
       logger.error('start agent %s failed: %o', task.taskId, error)
       unsubscribeAll(task)
@@ -223,13 +243,14 @@ export function registerAgentTask(ctx: HostCtx, hub: Hub, logger: LoggerLike): (
       logger.warn('whenIdle agent %s interrupted: %o', task.taskId, error)
     }
 
-    const status = task.stopRequested ? 'stopped' : 'done'
+    const status = task.stopRequested ? 'stopped' : task.lastError ? 'failed' : 'done'
     await teardown(task)
     return {
       taskId: task.taskId,
       sessionId: task.taskId,
       status,
       durationMs: Date.now() - task.startedAt,
+      ...(task.lastError === undefined ? {} : { error: task.lastError }),
     }
   }
 

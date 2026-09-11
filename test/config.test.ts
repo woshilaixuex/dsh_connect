@@ -19,6 +19,7 @@ import {
 const ENV_KEYS = [
   'DSH_CONNECT_HOST', 'DSH_CONNECT_HOSTNAME', 'DSH_CONNECT_PORT',
   'DSH_CONNECT_LOG_LEVEL', 'DSH_CONNECT_LOG_PATH', 'DSH_CONNECT_DB_PATH',
+  'DSH_CONNECT_AGENT_PROVIDER', 'DSH_CONNECT_AGENT_MODEL',
   'DSH_CONNECT_CONFIG', 'DSH_CONNECT_DOTENV',
 ]
 
@@ -93,6 +94,14 @@ describe('环境变量解析', () => {
   test('DSH_CONNECT_DB_PATH 空串表示禁用 SQLite', () => {
     process.env.DSH_CONNECT_DB_PATH = ''
     assert.equal(getConfig().dbPath, '')
+  })
+
+  test('DSH_CONNECT_AGENT_PROVIDER / _MODEL 覆盖模型路由', () => {
+    process.env.DSH_CONNECT_AGENT_PROVIDER = 'deepseek-official'
+    process.env.DSH_CONNECT_AGENT_MODEL = 'deepseek-v4-flash'
+    const config = getConfig()
+    assert.equal(config.agentProvider, 'deepseek-official')
+    assert.equal(config.agentModel, 'deepseek-v4-flash')
   })
 })
 

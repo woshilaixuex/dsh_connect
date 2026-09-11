@@ -29,8 +29,29 @@ export const ErrorCodes = {
   AGENT_NOT_FOUND: 'agent.not.found',
   BAD_REQUEST: 'bad.request',
   FORBIDDEN: 'forbidden',
+  SESSION_NOT_FOUND: 'session.not.found',
+  SESSION_BUSY: 'session.busy',
+  SESSION_RESUME_FAILED: 'session.resume-failed',
 } as const
 export type ErrorCode = (typeof ErrorCodes)[keyof typeof ErrorCodes]
+
+/** 推送码约定前缀。 */
+export const PushPrefix = {
+  /** 一次性任务事件流:task:<taskId> */
+  TASK: 'task:',
+  /** 会话事件流:session:<sessionId> */
+  SESSION: 'session:',
+} as const
+
+/** 组装会话推送码。 */
+export function sessionTopic(sessionId: string): string {
+  return `${PushPrefix.SESSION}${sessionId}`
+}
+
+/** 组装任务推送码。 */
+export function taskTopic(taskId: string): string {
+  return `${PushPrefix.TASK}${taskId}`
+}
 
 // ---------- 客户端 → 服务端 ----------
 

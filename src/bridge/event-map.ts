@@ -28,7 +28,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 /** 从 content block 数组里拼出纯文本(text 块)。 */
-function textOf(content: unknown): string | undefined {
+export function textOf(content: unknown): string | undefined {
   if (!Array.isArray(content)) return undefined
   const parts: string[] = []
   for (const block of content) {

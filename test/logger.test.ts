@@ -181,4 +181,19 @@ describe('FileExporter', () => {
     const content = readFileSync(join(dir, `dsh-connect-${localDateKey(ts)}.log`), 'utf8')
     assert.ok(content.includes('{"b":2}'))
   })
+
+  test('声明 levels 放开到 debug,否则 Cordis 默认阈值 1 会拦掉 warn/debug', () => {
+    const exporter = new FileExporter(makeTempDir(), LogLevel.DEV)
+    // Cordis 实际过滤:(levels[name] ?? levels.default ?? loggerLevel ?? 1) < level → 丢弃
+    const threshold = (exporter as { levels?: Record<string, number> }).levels?.default
+    assert.equal(threshold, 3)
+
+    const levelOf = { error: 0, info: 1, warn: 2, debug: 3 } as const
+    const passes = (type: keyof typeof levelOf): boolean =>
+      (exporter as { levels?: Record<string, number> }).levels!.default! >= levelOf[type]
+    assert.equal(passes('error'), true)
+    assert.equal(passes('info'), true)
+    assert.equal(passes('warn'), true) // 曾经被默认阈值 1 拦掉
+    assert.equal(passes('debug'), true) // 曾经被默认阈值 1 拦掉
+  })
 })

@@ -39,16 +39,19 @@ class FakeAgent {
 }
 
 interface CreatedEntry {
-  options: { sessionId: string; meta?: { cwd?: string } }
+  options: { sessionId: string; meta?: { cwd?: string }; agentOptions?: { provider?: string; model?: string } }
   agent: FakeAgent
   disposed: number
 }
 
-/** 假 agents 宿主服务:记录 create/dispose 调用。 */
+/** 假 agents 宿主服务:记录 create/dispose 调用。
+ *  create 刻意依赖 this(宿主真实实现第一步就是 this.ctx),
+ *  一旦桥接把方法解构出来单存导致接收者丢失,这里会直接抛错暴露。 */
 function makeAgentsService() {
   const created: CreatedEntry[] = []
   const service = {
-    create: async (options: unknown) => {
+    async create(this: unknown, options: unknown) {
+      if (this === undefined) throw new Error('agents.create called without receiver (this lost)')
       const opts = options as { sessionId: string }
       const entry: CreatedEntry = { options: opts, agent: new FakeAgent(opts.sessionId), disposed: 0 }
       created.push(entry)
@@ -70,11 +73,15 @@ interface HostHarness {
   emitAgentError(agentId: string, error: unknown): void
 }
 
-/** 假宿主 ctx:get('agents') 可注入;on/off 记录监听器供 emit 回放。 */
-function makeHost(agents?: unknown): HostHarness {
+/** 假宿主 ctx:get('agents'/'agentDefaultModel') 可注入;on/off 记录监听器供 emit 回放。 */
+function makeHost(agents?: unknown, defaultModel?: unknown): HostHarness {
   const listeners = new Map<string, Set<(...args: unknown[]) => void>>()
   const host: HostCtx = {
-    get: (key: string) => (key === 'agents' ? agents : undefined),
+    get: (key: string) => {
+      if (key === 'agents') return agents
+      if (key === 'agentDefaultModel') return defaultModel
+      return undefined
+    },
     on: (event, handler) => {
       let set = listeners.get(event)
       if (!set) {
@@ -107,12 +114,17 @@ let conn: FakeConn
 let agents: ReturnType<typeof makeAgentsService>
 let host: HostHarness
 
-function setup(agentsService?: unknown): void {
+/** 假宿主默认模型服务(hostDefaultModel=false 时不注入)。 */
+const HOST_DEFAULT_MODEL = {
+  currentSelection: () => ({ provider: 'host-provider', model: 'host-model', reasoningEffort: 'medium' }),
+}
+
+function setup(agentsService?: unknown, hostDefaultModel: unknown = HOST_DEFAULT_MODEL, taskOptions?: { provider?: string; model?: string }): void {
   hub = createHub(makeLogger())
   conn = new FakeConn()
   agents = makeAgentsService()
-  host = makeHost(agentsService ?? agents.service)
-  registerAgentTask(host.host, hub, makeLogger())
+  host = makeHost(agentsService ?? agents.service, hostDefaultModel === false ? undefined : hostDefaultModel)
+  registerAgentTask(host.host, hub, makeLogger(), taskOptions ?? {})
 }
 
 beforeEach(() => {
@@ -128,6 +140,12 @@ describe('agent.run 全流程', () => {
     assert.equal(agents.created.length, 1)
     const entry = agents.created[0]!
     assert.ok(entry.options.sessionId.startsWith('remote-'))
+    // 未显式配模型时,回退宿主默认模型(实机:agent 缺 provider/model 会直接报错)
+    assert.deepEqual(entry.options.agentOptions, {
+      provider: 'host-provider',
+      model: 'host-model',
+      reasoningEffort: 'medium',
+    })
     assert.equal(entry.agent.messages.length, 1)
     const message = entry.agent.messages[0] as { role: string; content: { type: string; text: string }[]; source: { kind: string } }
     assert.equal(message.role, 'user')
@@ -155,13 +173,6 @@ describe('agent.run 全流程', () => {
       assert.deepEqual(msgEvt.data, { kind: 'assistant.message', text: '收到', turn: 1, step: 1 })
     }
 
-    // agent/error 事件回推
-    host.emitAgentError(sessionId, new Error('工具炸了'))
-    const errEvt = conn.frames[2]!
-    if (errEvt.kind === 'evt') {
-      assert.deepEqual(errEvt.data, { kind: 'agent.error', message: '工具炸了' })
-    }
-
     // 静默 → res done,并 dispose
     entry.agent.settle()
     await tick(6)
@@ -177,7 +188,7 @@ describe('agent.run 全流程', () => {
 
     // 收尾后清理:宿主监听已移除,迟到的事件不再回推
     host.emitSession(sessionId, { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '迟到' }] } } } as SessionEventLike)
-    assert.equal(conn.frames.length, 4)
+    assert.equal(conn.frames.length, 3)
   })
 
   test('assistant/chunk 默认不转发;chunks:true 才转发', async () => {
@@ -219,6 +230,51 @@ describe('agent.run 全流程', () => {
     frame = conn.frames[0]!
     assert.equal(frame.kind, 'res')
     if (frame.kind === 'res' && !frame.ok) assert.equal(frame.code, ErrorCodes.HOST_UNAVAILABLE)
+  })
+})
+
+describe('模型路由', () => {
+  test('显式配置 provider/model 时覆盖宿主默认', async () => {
+    setup(undefined, undefined, { provider: 'cfg-provider', model: 'cfg-model' })
+    hub.dispatch(conn, req('m1', 'agent.run', { prompt: 'hi' }))
+    await tick(6)
+    assert.deepEqual(agents.created[0]!.options.agentOptions, { provider: 'cfg-provider', model: 'cfg-model' })
+    agents.created[0]!.agent.settle()
+    await tick(6)
+  })
+
+  test('宿主无默认模型服务时 agentOptions 为 undefined(交给宿主报错)', async () => {
+    setup(undefined, false)
+    hub.dispatch(conn, req('m2', 'agent.run', { prompt: 'hi' }))
+    await tick(6)
+    assert.equal(agents.created[0]!.options.agentOptions, undefined)
+    agents.created[0]!.agent.settle()
+    await tick(6)
+  })
+})
+
+describe('agent.error 反映到最终结果', () => {
+  test('回推 agent.error 事件,并把 status 标为 failed', async () => {
+    hub.dispatch(conn, req('r1', 'agent.run', { prompt: '会失败' }))
+    await tick(6)
+    const entry = agents.created[0]!
+    const sessionId = entry.options.sessionId
+
+    host.emitAgentError(sessionId, new Error('工具炸了'))
+    const evt = conn.frames[0]!
+    assert.equal(evt.kind, 'evt')
+    if (evt.kind === 'evt') {
+      assert.deepEqual(evt.data, { kind: 'agent.error', message: '工具炸了' })
+    }
+
+    entry.agent.settle()
+    await tick(6)
+    const res = conn.frames.at(-1)!
+    assert.equal(res.kind, 'res')
+    if (res.kind !== 'res' || !res.ok) return
+    const data = res.data as { status: string; error: string }
+    assert.equal(data.status, 'failed')
+    assert.equal(data.error, '工具炸了')
   })
 })
 

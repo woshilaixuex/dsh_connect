@@ -54,6 +54,48 @@ export interface DbHandle {
   dispose(): void
 }
 
+/** 一次 schema 迁移:版本号从 version-1 升到 version。 */
+export interface Migration {
+  version: number
+  up(db: DatabaseSync): void
+}
+
+/**
+ * 执行顺序迁移:把 schema_version 从当前值一路升到目标版本。
+ *
+ * - 版本存于 meta(key,value) 表(首次自动建);
+ * - 只应用 version > 当前版本的迁移,按 version 升序;
+ * - 每个迁移单独事务化,失败即中断并抛出(不留下半应用的 schema)。
+ *
+ * @returns 应用后的 schema 版本。
+ */
+export function migrate(db: DatabaseSync, migrations: readonly Migration[]): number {
+  db.exec('CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)')
+  const readVersion = (): number => {
+    const row = db.prepare('SELECT value FROM meta WHERE key = ?').get('schema_version') as
+      | { value: string }
+      | undefined
+    const parsed = row ? Number(row.value) : 0
+    return Number.isFinite(parsed) ? parsed : 0
+  }
+
+  const pending = [...migrations].filter((m) => m.version > readVersion()).sort((a, b) => a.version - b.version)
+  let current = readVersion()
+  for (const migration of pending) {
+    db.exec('BEGIN')
+    try {
+      migration.up(db)
+      db.prepare('INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)').run('schema_version', String(migration.version))
+      db.exec('COMMIT')
+      current = migration.version
+    } catch (error) {
+      db.exec('ROLLBACK')
+      throw error
+    }
+  }
+  return current
+}
+
 /**
  * 打开数据库文件(自动建目录),应用基础 PRAGMA。
  * @param path resolveDbPath 的返回值;undefined 时不打开(直接抛错,调用方应先判空)。

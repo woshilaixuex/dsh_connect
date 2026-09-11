@@ -4,6 +4,7 @@ import { getConfig } from './config/config.js'
 import { createServer } from './server/server.js'
 import { FileExporter, resolveLogDir } from './log/logger.js'
 import { openDatabase, resolveDbPath } from './store/store.js'
+import { openSessionIndex, type SessionIndex } from './sessions/session-index.js'
 
 /**
  * dsh-connect 插件入口。
@@ -11,8 +12,8 @@ import { openDatabase, resolveDbPath } from './store/store.js'
  * 职责:
  *  1. 读取全局 config(单例 + env 解析)
  *  2. 按 logPath 配置注册文件日志 exporter(不配则不落盘)
- *  3. 打开 SQLite 存储(dbPath 空串禁用;默认落在 dsh home 下)
- *  4. 启动 LAN WebSocket 代理服务(把任务转接给 dsh)
+ *  3. 打开 SQLite 存储(dbPath 空串禁用;默认落在 dsh home 下)并建会话索引
+ *  4. 启动 LAN WebSocket 代理服务(一次性任务 + 会话能力)
  *  5. 注册模型可见工具(暂保留脚手架 echo 示例)
  */
 export const name = 'dsh-connect'
@@ -33,10 +34,13 @@ export function apply(ctx: Context) {
     logger.info('file logging enabled at %s (level=%s)', logDir, config.logLevel)
   }
 
-  // SQLite 存储基座:dbPath 空串 = 不启用;生命周期绑定 ctx
+  // SQLite 存储基座:dbPath 空串 = 不启用;生命周期绑定 ctx。
+  // 启用时由它承载会话索引;禁用时 server 回退内存索引。
   const dbPath = resolveDbPath(ctx, config.dbPath)
+  let sessionIndex: SessionIndex | undefined
   if (dbPath) {
     const store = openDatabase(ctx, dbPath)
+    sessionIndex = openSessionIndex(store.db)
     ctx.logger('dsh-connect/store').info('sqlite database opened at %s', store.path)
     ctx.effect(
       () => () => {
@@ -45,11 +49,11 @@ export function apply(ctx: Context) {
       'dsh-connect.store',
     )
   } else {
-    logger.info('sqlite storage disabled (dbPath empty)')
+    logger.info('sqlite storage disabled (dbPath empty); session index will be in-memory')
   }
 
   // 启动 WS 服务(生命周期绑定 ctx:插件卸载时自动关闭)
-  const server = createServer(ctx, config)
+  const server = createServer(ctx, config, { sessionIndex })
   ctx.effect(() => () => {
     void server.dispose()
   }, 'dsh-connect.server')

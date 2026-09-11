@@ -25,6 +25,14 @@ export interface Config {
    * undefined = 用默认位置(dsh home 下);空串 = 不启用;相对路径基于 dsh home;绝对路径原样。
    */
   dbPath?: string
+  /**
+   * 远程任务用的模型路由(provider/model 必须成对)。
+   * 不配则回退宿主默认模型(ctx.agentDefaultModel)。
+   */
+  agentProvider?: string
+  agentModel?: string
+  /** 会话空闲回收阈值(ms):超过则 dispose 常驻 agent,会话本身留在宿主。 */
+  sessionIdleTimeoutMs: number
 }
 /**
  * 默认配置，做配置加载降级兜底
@@ -33,6 +41,7 @@ export const DEFAULT_CONFIG: Config = {
   hostName: '0.0.0.0',
   listenPort: 8097,
   logLevel: LogLevel.DEV,
+  sessionIdleTimeoutMs: 10 * 60 * 1000,
 }
 
 /** 本地配置文件路径,可用 env DSH_CONNECT_CONFIG 覆盖。 */
@@ -92,6 +101,17 @@ function parsePort(value: string | undefined): number {
   return port
 }
 
+/** 解析毫秒时长;非法/非正数回退默认。 */
+function parseDuration(value: string | undefined): number {
+  if (!value) return DEFAULT_CONFIG.sessionIdleTimeoutMs
+  const ms = Number(value)
+  if (!Number.isFinite(ms) || ms <= 0) {
+    console.warn(`[dsh-connect] 非法时长 "${value}",回退 ${DEFAULT_CONFIG.sessionIdleTimeoutMs}ms`)
+    return DEFAULT_CONFIG.sessionIdleTimeoutMs
+  }
+  return ms
+}
+
 function readConfigFile(): Partial<Config> {
   // 默认取插件根目录的 dsh-connect.config.json;可用 DSH_CONNECT_CONFIG 覆盖(绝对/相对路径)
   const filePath = process.env[CONFIG_FILE_ENV]
@@ -124,6 +144,12 @@ function readEnv(): Partial<Config> {
   const dbPath = process.env[`${ENV_PREFIX}DB_PATH`]
   // dbPath 空串也生效(语义:禁用 SQLite),区别于其它字段的「非空才覆盖」
   if (dbPath !== undefined) env.dbPath = dbPath
+  const agentProvider = process.env[`${ENV_PREFIX}AGENT_PROVIDER`]
+  if (agentProvider) env.agentProvider = agentProvider
+  const agentModel = process.env[`${ENV_PREFIX}AGENT_MODEL`]
+  if (agentModel) env.agentModel = agentModel
+  const idleMs = process.env[`${ENV_PREFIX}SESSION_IDLE_MS`]
+  if (idleMs) env.sessionIdleTimeoutMs = parseDuration(idleMs)
   return env
 }
 

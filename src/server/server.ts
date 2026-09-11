@@ -13,7 +13,7 @@ import { randomUUID } from 'node:crypto'
 import type { Context } from '@deepseek-ai/cordis'
 import { WebSocket, WebSocketServer, type RawData } from 'ws'
 import type { Config } from '../config/config.js'
-import type { HostCtx } from '../bridge/agent-bridge.js'
+import { detectAgentAdapter, type HostCtx } from '../bridge/agent-bridge.js'
 import { createHub, type ConnectionHandle, type Hub } from '../hub/hub.js'
 import {
   ErrorCodes,
@@ -25,6 +25,10 @@ import {
   type S2C,
 } from '../protocol/frame.js'
 import { registerAgentTask } from '../tasks/agent-task.js'
+import { registerSessionTask } from '../tasks/session-task.js'
+import { createMemorySessionIndex, type SessionIndex } from '../sessions/session-index.js'
+import { createSessionRegistry } from '../sessions/session-registry.js'
+import { readPersistedHistory } from '../sessions/persisted-history.js'
 
 /** ws message 的 data 可能有 Buffer / ArrayBuffer / Buffer[] 三种形态,统一成 Buffer。 */
 function toBuffer(data: RawData): Buffer {
@@ -42,14 +46,45 @@ export interface ProxyServer {
   port: Promise<number>
 }
 
-export function createServer(ctx: Context, config: Config): ProxyServer {
+export interface ServerDeps {
+  /** 会话索引;缺省用内存实现(dbPath 禁用时)。 */
+  sessionIndex?: SessionIndex
+}
+
+export function createServer(ctx: Context, config: Config, deps: ServerDeps = {}): ProxyServer {
   const logger = ctx.logger('dsh-connect/server')
   const host = ctx as unknown as HostCtx
   const hub = createHub(logger)
 
   // boot:插件内部注册内置任务接收器
+  let registry: ReturnType<typeof createSessionRegistry> | undefined
   const disposers: (() => void)[] = []
-  disposers.push(registerAgentTask(host, hub, ctx.logger('dsh-connect/task')))
+  disposers.push(
+    registerAgentTask(host, hub, ctx.logger('dsh-connect/task'), {
+      provider: config.agentProvider,
+      model: config.agentModel,
+    }),
+  )
+
+  // 会话能力:依赖宿主 agent 服务;没有则只注册一次性任务
+  const adapter = detectAgentAdapter(host)
+  if (adapter) {
+    const sessionIndex = deps.sessionIndex ?? createMemorySessionIndex()
+    const sessionLogger = ctx.logger('dsh-connect/session')
+    registry = createSessionRegistry(host, hub, adapter, sessionIndex, sessionLogger, {
+      idleTimeoutMs: config.sessionIdleTimeoutMs,
+      provider: config.agentProvider,
+      model: config.agentModel,
+      // resume 后补齐历史(否则恢复的会话只有 resume 之后的消息)
+      loadHistory: (sessionId) => readPersistedHistory(host, sessionId),
+    })
+    disposers.push(
+      registerSessionTask({ host, hub, logger: sessionLogger, index: sessionIndex, registry }),
+    )
+    logger.info('session capability enabled (idle timeout %dms)', config.sessionIdleTimeoutMs)
+  } else {
+    logger.warn('no host agent service — session.* receivers not registered')
+  }
 
   const wss = new WebSocketServer({
     host: config.hostName,
@@ -151,6 +186,14 @@ export function createServer(ctx: Context, config: Config): ProxyServer {
           disposer()
         } catch (error) {
           logger.warn('dispose receiver failed: %o', error)
+        }
+      }
+      // 会话常驻 agent 与宿主监听统一释放
+      if (registry) {
+        try {
+          await registry.disposeAll()
+        } catch (error) {
+          logger.warn('dispose sessions failed: %o', error)
         }
       }
       for (const conn of [...conns]) hub.clearConn(conn)

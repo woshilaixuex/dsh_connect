@@ -59,6 +59,13 @@ export class FileExporter implements Exporter {
   private readonly prodMode: boolean
   /** Logger.format 需要;留空则回退 Cordis defaultFormatters。 */
   readonly formatters: Record<string, never> = {}
+  /**
+   * exporter 自身的级别阈值。Cordis 的过滤是
+   * `(levels[name] ?? levels.default ?? logger.level ?? 1) < level → 丢弃`,
+   * 默认阈值 1 会把 warn(2)/debug(3) 全部拦下 —— 必须显式放开到 debug(3),
+   * 再由本类的 PROD 逻辑决定是否落盘。
+   */
+  readonly levels: Record<string, number> = { default: 3 }
 
   constructor(logDir: string, logLevel?: LogLevel) {
     this.logDir = logDir

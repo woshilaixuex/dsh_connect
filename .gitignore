@@ -21,7 +21,7 @@ logs/
 
 # ---------- 本地工具目录 ----------
 .commandcode/
-.agents/
+.agents/notes
 
 # ---------- 测试临时产物 ----------
 coverage/
