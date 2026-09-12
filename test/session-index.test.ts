@@ -196,3 +196,89 @@ describe('索引对象被解构后仍可用(无 this 依赖)', () => {
     assert.equal(get('sess-x')!.title, 't')
   })
 })
+
+/** 来源标记 + 迁移。 */
+function runSourceSuite(name: string, make: () => SessionIndex) {
+  describe(`SessionIndex 来源标记: ${name}`, () => {
+    let index: SessionIndex
+    beforeEach(() => {
+      index = make()
+    })
+
+    test('client- 前缀默认判为 client', () => {
+      assert.equal(index.upsert('client-abc').source, 'client')
+    })
+
+    test('非 client- 前缀默认判为 host(未显式指定时)', () => {
+      assert.equal(index.upsert('session-42').source, 'host')
+    })
+
+    test('显式 source 优先于前缀推断', () => {
+      assert.equal(index.upsert('session-42', { source: 'client' }).source, 'client')
+      assert.equal(index.upsert('client-abc', { source: 'host' }).source, 'host')
+    })
+
+    test('重复 upsert 保留原 source', () => {
+      index.upsert('session-42', { source: 'client' })
+      assert.equal(index.upsert('session-42').source, 'client')
+    })
+
+    test('listAll 含软删且不截断', () => {
+      index.upsert('a', { now: 1000 })
+      index.upsert('b', { now: 2000 })
+      index.softDelete('a')
+      const all = index.listAll()
+      assert.equal(all.length, 2)
+      assert.equal(all.find((r) => r.sessionId === 'a')!.deleted, true)
+    })
+
+    test('softDelete 未登记过的宿主会话会先补登记', () => {
+      assert.equal(index.get('session-77'), undefined)
+      assert.equal(index.softDelete('session-77'), true)
+      const row = index.get('session-77')!
+      assert.equal(row.source, 'host')
+      assert.equal(row.deleted, true)
+    })
+  })
+}
+
+runSourceSuite('SQLite', () => openSessionIndex(newDb()))
+runSourceSuite('内存', () => createMemorySessionIndex())
+
+describe('schema 迁移 v2', () => {
+  test('v1 库升级到 v2 后旧行回填为 client', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dsh-connect-migrate-'))
+    dirs.push(dir)
+    const db = new DatabaseSync(join(dir, 'v1.db'))
+    dbs.push(db)
+
+    // 手工造一个「只有 v1」的库:建 v1 表 + 记 schema_version=1
+    db.exec(`
+      CREATE TABLE sessions (
+        id TEXT PRIMARY KEY, title TEXT, created_at INTEGER NOT NULL,
+        last_active_at INTEGER NOT NULL, last_message TEXT,
+        message_count INTEGER NOT NULL DEFAULT 0, deleted_at INTEGER
+      )
+    `)
+    db.exec('CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)')
+    db.prepare('INSERT INTO meta (key, value) VALUES (?, ?)').run('schema_version', '1')
+    db.prepare('INSERT INTO sessions (id, created_at, last_active_at) VALUES (?, ?, ?)').run('old-1', 1, 1)
+
+    // 打开索引 → 触发 v2 迁移
+    const index = openSessionIndex(db)
+    const row = index.get('old-1')!
+    assert.equal(row.source, 'client', '旧行应回填为 client(它们都是本插件建的)')
+
+    const version = db.prepare("SELECT value FROM meta WHERE key='schema_version'").get() as { value: string }
+    assert.equal(version.value, '2')
+  })
+
+  test('迁移可重复执行(再开一次不报错)', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dsh-connect-migrate-'))
+    dirs.push(dir)
+    const db = new DatabaseSync(join(dir, 'twice.db'))
+    dbs.push(db)
+    openSessionIndex(db)
+    assert.doesNotThrow(() => openSessionIndex(db))
+  })
+})

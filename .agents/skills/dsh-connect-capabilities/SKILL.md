@@ -38,22 +38,32 @@ node scripts/probe.mjs ws://192.168.1.10:8080
 | # | 能力 | 接入方式 | 状态 |
 |---|---|---|---|
 | 1 | LAN WebSocket 服务(协议 v1) | `ws://<host>:<port>` JSON 帧 | ✅ 已实现 |
-| 2 | 远程执行 dsh agent 任务 | 接收码 `agent.run` | ✅ 已实现(实机验证) |
-| 3 | 停止运行中任务 | 接收码 `agent.stop` | ✅ 已实现 |
-| 4 | 任务执行事件流 | 推送主题 `task:<taskId>` | ✅ 已实现 |
-| 5 | **会话:多轮对话** | 接收码 `session.create` / `session.send` | ✅ 已实现(实机验证上下文延续) |
-| 6 | **会话列表 / 历史 / 软删** | `session.list` / `session.history` / `session.get` / `session.delete` | ✅ 已实现 |
-| 7 | **会话常驻 + resume 恢复** | 自动;空闲超时回收后退回 resume | ✅ 已实现(实机验证) |
-| 8 | 会话事件流 | 推送主题 `session:<sessionId>` | ✅ 已实现 |
-| 9 | 模型路由选择 | env / 宿主默认模型 | ✅ 已实现 |
-| 10 | 配置面(env/.env/文件) | `DSH_CONNECT_*` | ✅ 已实现 |
-| 11 | 文件日志(按天切分) | 读 `~/.dsh/logs/dsh-connect-*.log` | ✅ 已实现 |
-| 12 | SQLite 存储基座 + 迁移器 | 直接开 db 文件 | ✅ 基座已实现(仅会话索引表) |
-| 13 | 模型可见工具 `dsh_connect` | agent 调用 tools | ⚠️ echo 脚手架 |
-| 14 | 鉴权 | — | ❌ 未实现 |
-| 15 | 服务端主动心跳 | — | ❌ 未实现(仅应答 ping) |
+| 2 | **HTTP 只读接口** | `http://<host>:<port>` GET JSON | ✅ 已实现(实机验证 15/15) |
+| 3 | 远程执行 dsh agent 任务 | 接收码 `agent.run` | ✅ 已实现(实机验证) |
+| 4 | 停止运行中任务 | 接收码 `agent.stop` | ✅ 已实现 |
+| 5 | 任务执行事件流 | 推送主题 `task:<taskId>` | ✅ 已实现 |
+| 6 | **会话:多轮对话** | 接收码 `session.create` / `session.send` | ✅ 已实现(实机验证上下文延续) |
+| 7 | **会话列表 / 历史 / 软删** | `session.list` / `session.history` / `session.get` / `session.delete` | ✅ 已实现 |
+| 8 | **镜像宿主已有会话** | `session.list` 返回宿主会话 ∪ 本插件会话 | ✅ 已实现(实机验证 host + client 并存) |
+| 9 | **复用宿主会话** | `session.create` 传已有 `sessionId` | ✅ 已实现(实机验证 reused=true) |
+| 10 | **会话来源标记** | `source: 'client' \| 'host'` | ✅ 已实现 |
+| 11 | **工作区列表** | 接收码 `workspace.list`;HTTP `GET /workspaces` | ✅ 已实现(registry 优先,cwd 兜底) |
+| 12 | **思考过程(reasoning)** | 事件 `assistant.reasoning` / `assistant.reasoning-chunk` | ✅ 已实现(实机验证) |
+| 13 | **执行过程结构** | 事件 `session.todo` / `session.turn` / `tool.call.label` | ✅ 已实现(实机验证) |
+| 14 | 会话常驻 + resume 恢复 | 自动;空闲超时回收后退回 resume | ✅ 已实现(实机验证) |
+| 15 | 会话事件流 | 推送主题 `session:<sessionId>` | ✅ 已实现 |
+| 16 | 模型路由选择 | env / 宿主默认模型 | ✅ 已实现 |
+| 17 | 配置面(env/.env/文件) | `DSH_CONNECT_*` | ✅ 已实现 |
+| 18 | 文件日志(按天切分) | 读 `~/.dsh/logs/dsh-connect-*.log` | ✅ 已实现 |
+| 19 | SQLite 存储基座 + 迁移器 | 直接开 db 文件 | ✅ 基座已实现(会话索引表 + source 列) |
+| 20 | 模型可见工具 `dsh_connect` | agent 调用 tools | ⚠️ echo 脚手架 |
+| 21 | 鉴权 | — | ❌ 未实现 |
+| 22 | 服务端主动心跳 | — | ❌ 未实现(仅应答 ping) |
+
+**HTTP vs WS**:HTTP 是**只读**的便捷入口(浏览器 fetch / 安卓 OkHttp / curl),取数据用它即可;发消息、建会话、删除等**写操作走 WS**。
 
 **会话 vs 一次性任务**:`agent.run` 无状态、跑完即弃;要「记得上文」必须用会话族(`session.*`)。
+**宿主会话 vs 客户端会话**:`source='host'` 是宿主已有的(web UI 或其它入口);`source='client'` 是本插件为客户端建的(`client-` 前缀)。
 
 ---
 
@@ -94,7 +104,30 @@ pnpm dsh --profile dev-connect
 
 字段级规格与客户端实现见兄弟 skill **`dsh-connect-client`**([protocol.md](../dsh-connect-client/references/protocol.md)、[kotlin-client.md](../dsh-connect-client/references/kotlin-client.md))。
 
-### 2–4. 任务执行 / 停止 / 事件流(核心能力)
+### 2. HTTP 只读接口(取数据最省事的方式)
+
+**独立端口**,默认 **8098**(`DSH_CONNECT_HTTP_PORT` 覆盖;`-1` 禁用)。只读、CORS 全开、无鉴权。
+
+| 路由 | 查询参数 | 响应 |
+|---|---|---|
+| `GET /health` | — | `{ ok, uptimeMs, sessions:{host,index,live}, workspaces:{source,count} }` |
+| `GET /workspaces` | `includeDeleted?` | `{ ok, source:'registry'\|'cwd', workspaces:[{workspaceId,path,title,sessionIds}] }` |
+| `GET /sessions` | `limit?`(50,上限 1000)`offset?`(0)`includeDeleted?` | `{ ok, sessions:[SessionSummary], meta }` |
+| `GET /sessions/:sessionId/history` | `limit?`(100) | `{ ok, sessionId, source:'memory'\|'persisted', messages:[{role,text,ts}] }` |
+
+```bash
+curl http://127.0.0.1:8098/health
+curl http://127.0.0.1:8098/workspaces
+curl "http://127.0.0.1:8098/sessions?limit=10"
+curl "http://127.0.0.1:8098/sessions/<id>/history?limit=20"
+```
+
+- 仅 `GET`/`HEAD`;`OPTIONS` → `204`;其它方法 `405`。**写操作走 WS**。
+- 统一错误体 `{ ok:false, code, message, status }`(`400`/`404`/`405`/`500`)。
+- **无缓存**:每次实时读宿主,会话多时较慢。
+- 冒烟:`node scripts/http-smoke.mjs http://127.0.0.1:8098`(零依赖,用内置 fetch)。
+
+### 3–5. 一次性任务:执行 / 停止 / 事件流
 
 | 方向 | 码 | payload | 返回/说明 |
 |---|---|---|---|
@@ -111,20 +144,28 @@ pnpm dsh --profile dev-connect
 → `whenIdle()` 等静默 → dispose。宿主事件经全局 `ctx.on('session/event'|'agent/status'|'agent/error')`
 按 session/agent id 过滤后回推。
 
-### 5–8. 会话(多轮对话)
+### 6–15. 会话(多轮对话)+ 宿主机镜像
 
 | 方向 | 码 | payload | 返回/说明 |
 |---|---|---|---|
-| 接收 | `session.create` | `{ title? }` | res.data `{sessionId, title?, createdAt}`;**发起连接自动订阅** `session:<id>` |
-| 接收 | `session.list` | `{ limit?, offset?, includeDeleted? }` | `{ sessions: [...] }`,含 `live` 标记(当前是否有常驻 agent) |
-| 接收 | `session.get` | `{ sessionId }` | 单个摘要 |
+| 接收 | `session.create` | `{ sessionId?, title?, cwd? }` | `{ sessionId, source, reused, title? }`;**传已有 id 即复用**;不传则生成 `client-<uuid>`。**发起连接自动订阅** `session:<id>` |
+| 接收 | `session.list` | `{ limit?, offset?, includeDeleted? }` | `{ sessions: [SessionSummary] }` —— **宿主会话 ∪ 本插件会话** |
+| 接收 | `session.get` | `{ sessionId }` | 单个 `SessionSummary`(宿主会话也可查) |
 | 接收 | `session.history` | `{ sessionId, limit? }` | `{ messages: [{role, text, ts}] }` |
 | 接收 | `session.send` | `{ sessionId, prompt, chunks? }` | `{ sessionId, status, durationMs, error? }`;agent 记得上下文 |
 | 接收 | `session.stop` | `{ sessionId }` | 打断**当前轮**,保留会话 |
 | 接收 | `session.delete` | `{ sessionId }` | **软删**(宿主无删除 API,仅从列表隐藏) |
-| 推送 | `session:<sessionId>` | — | 事件 kind 同 task 主题,另有 `session.user-message`(用户输入回显) |
+| 接收 | `workspace.list` | `{ includeDeleted? }` | `{ source: 'registry'\|'cwd', workspaces: [{workspaceId, path, title, sessionIds}] }` |
+| 推送 | `session:<sessionId>` | — | 见下方事件 kind |
 
-**存储归属**:会话真相 = 宿主 session(JSONL 持久化在 `~/.dsh/sessions`);本插件 SQLite 只存**客户端侧索引**(标题/时间/预览/软删标记)。
+`SessionSummary` = `{ sessionId, source, title?, cwd?, createdAt, updatedAt, live, persisted, messageCount?, lastMessage?, deleted? }`
+
+**来源标记**:`source: 'client'` = 本插件为客户端创建(`client-` 前缀);`source: 'host'` = 宿主已有。
+宿主侧**没有**可用字段表达这个(`header.origin` 只有 `'subagent'` 且是所有权判据),所以存在本插件索引里。
+
+**存储归属**:会话真相 = 宿主 session(JSONL 持久化在 `~/.dsh/sessions`);本插件 SQLite 只存**客户端侧索引**(来源/标题/时间/预览/软删)。宿主标题经 `sessionQuery.readTitle` 批量读取。
+
+**工作区**:`workspace.list` 优先复用宿主的 `ctx.workspaceRegistry`(→ `source:'registry'`,含用户在 web 侧自定义的名称);该服务**不在 base bundle**(只在 web-app),未加装时自动按会话 `cwd` 分组(→ `source:'cwd'`)。传 `cwd` 建会话才能挂进工作区(不传落 `_no-cwd` 桶)。
 
 **生命周期**:首次使用拉起常驻 agent → 空闲超时(默认 10min,`DSH_CONNECT_SESSION_IDLE_MS`)回收 → 再发消息自动 `ctx.agents.resume` **恢复上下文**(失败回退新建)。同会话消息**串行**执行,不同会话并行。
 
@@ -132,9 +173,23 @@ pnpm dsh --profile dev-connect
 
 - 历史里可能含宿主注入的上下文消息(`<system-reminder>` 之类),客户端可按需过滤。
 - `session.delete` 只隐藏索引,**宿主会话文件仍保留**(可用 `includeDeleted: true` 查到)。
-- 要观察**别人创建**的会话,需显式 `sub session:<id>`(只有创建者自动订阅)。
+- 要观察**别人创建**的会话,需显式 `sub session:<id>`(创建者自动订阅)。
 
-### 9. 模型路由
+### 12–13. 思考与执行过程(推送到会话主题)
+
+| kind | 载荷 | 说明 |
+|---|---|---|
+| `assistant.reasoning` | `{ text, turn?, step? }` | **完整思考过程**,默认推送;顺序在 `assistant.message` 之前 |
+| `assistant.reasoning-chunk` | `{ index?, text?, turn?, step? }` | 思考的流式增量,仅 `chunks:true` |
+| `session.todo` | `{ todos: [{ content, status }] }` | 模型的待办清单(整体替换),来自宿主 `todo/write` |
+| `session.turn` | `{ turn, phase: 'start'\|'end', reason? }` | 轮次边界,客户端可渲染阶段 |
+| `session.plan` | `{ active, pending? }` | 计划模式状态 |
+| `tool.call` | `{ callId, name, arguments, label? }` | `label` 是宿主 `presentCall` 给的人类可读标题(如 `todo_write` → `Update todo list`) |
+
+这些都是**复用宿主既有产物**:reasoning 来自 `assistant/message` 的 reasoning 块与 `reasoning-delta` 增量;todo 来自 `todo/write` 事件;tool label 来自 `ctx.tools.get(name).presentCall()`。
+实测一轮任务能同时看到:`session.turn` → `assistant.reasoning` → `session.todo` → `tool.call(label)` → `tool.result` → `assistant.message`。
+
+### 16. 模型路由
 
 不配则回退宿主服务 `ctx.agentDefaultModel`(base bundle 默认 `deepseek-official`/`deepseek-v4-flash`)。
 要指定:
@@ -146,7 +201,7 @@ pnpm dsh --profile dev-connect
 
 **缺模型路由的症状**:`agent.run` 返回 `status:"failed"`,事件流里有 `agent.error`,message 含 `has no provider/model`。
 
-### 10. 配置面
+### 17. 配置面
 
 优先级(高 → 低):`setConfig()` 运行时覆盖 > 进程 env > 插件根 `.env` > `dsh-connect.config.json` > `DEFAULT_CONFIG`。
 
@@ -154,16 +209,18 @@ pnpm dsh --profile dev-connect
 |---|---|---|
 | `DSH_CONNECT_HOST` / `DSH_CONNECT_HOSTNAME` | 监听地址(前者优先) | `0.0.0.0` |
 | `DSH_CONNECT_PORT` | WS 端口(非法/越界回退默认) | `8097` |
+| `DSH_CONNECT_HTTP_PORT` | HTTP 只读接口端口;**`-1` = 禁用**;`0` = 随机 | `8098` |
 | `DSH_CONNECT_LOG_LEVEL` | `dev`/`debug`/`prod` | `dev` |
 | `DSH_CONNECT_LOG_PATH` | 日志目录;相对路径基于 `~/.dsh`;**空 = 不落盘** | 未设(即不落盘) |
 | `DSH_CONNECT_DB_PATH` | 数据库;**空串 = 禁用**;相对路径基于 `~/.dsh` | 未设(默认落 `~/.dsh/dsh-connect/dsh-connect.db`) |
 | `DSH_CONNECT_AGENT_PROVIDER` / `_MODEL` | 模型路由 | 未设(用宿主默认) |
+| `DSH_CONNECT_SESSION_IDLE_MS` | 会话空闲回收阈值(ms) | `600000`(10min) |
 | `DSH_CONNECT_CONFIG` | 覆盖配置文件路径 | 插件根 `dsh-connect.config.json` |
 | `DSH_CONNECT_DOTENV` | 设 `0` 禁用 `.env` 注入(测试隔离) | 未设 |
 
 注:`.env` 只注入进程**尚未设置**的变量(真实 env 优先);Node 不自动读 `.env`,由 `loadDotEnv()` 基于 `import.meta.url` 定位插件根。
 
-### 11. 文件日志
+### 18. 文件日志
 
 **怎么读**:`<DSH_CONNECT_LOG_PATH>/dsh-connect-YYYY-MM-DD.log`(按本地日期切分)。本机 `.env` 设了 `DSH_CONNECT_LOG_PATH=logs`,故实际在 `~/.dsh/logs/`。
 行格式:`[ISO时间] [LEVEL] [name] 消息`。
@@ -172,7 +229,7 @@ pnpm dsh --profile dev-connect
 - **同时**也会打到 console(exporter 是发布-订阅,多个 exporter 收到同一条)。
 - 排查启动问题看这几行:`plugin loaded, config = {...}`、`file logging enabled at ...`、`sqlite database opened at ...`、`host agent service detected: agents|agentLoop`、`ws server listening on ...`。
 
-### 12. SQLite 存储基座
+### 19. SQLite 存储基座
 
 **怎么连**:它就是一个普通 SQLite 文件,可用任意 sqlite 客户端打开。
 
@@ -182,18 +239,20 @@ pnpm dsh --profile dev-connect
 - 已含**会话索引表** `sessions`(id/title/created_at/last_active_at/last_message/message_count/deleted_at)+ `meta.schema_version` 迁移记录。
 - `dbPath` 空串时禁用 SQLite,会话索引退化为**内存实现**(重启即丢,但宿主会话不受影响)。
 
-### 13. 模型可见工具 `dsh_connect`
+### 20. 模型可见工具 `dsh_connect`
 
 注册进宿主 `ctx.tools` 的工具,**由模型在推理中调用**(不是 WS 客户端直接调)。当前是 `dsh-dev` 脚手架保留的 echo 示例:
 
 - 入参 `{ message: string }` → 出参 `{ ok: boolean, echoed: string }`,即回显。
 - 用途:验证插件→宿主的 tool 注册链路通了。**不是业务能力**,可替换或删除。
 
-### 14–15. 未实现 / 边界(明确没有的)
+### 21–22. 未实现 / 边界(明确没有的)
 
 | 项 | 说明 |
 |---|---|
-| 鉴权 | 无任何认证,局域网信任模型;不要暴露到公网 |
+| 鉴权 | 无任何认证,局域网信任模型;**HTTP 与 WS 都没有**;不要暴露到公网 |
+| HTTP 写操作 | HTTP 只读(GET/HEAD);发消息/建会话/删除走 WS |
+| HTTP 缓存 / 实时推送 | 无缓存,每次实时读宿主;实时事件仍走 WS(没有 SSE/WebSocket over HTTP) |
 | 服务端心跳定时器 | 只有客户端 `ping` → 服务端 `pong`;**服务端不主动探活** |
 | 会话硬删除 | 宿主无删除 API,只能软删索引(文件仍在) |
 | 会话归属隔离 | 局域网共享模型:任何连接可见/可发消息到任何会话 |

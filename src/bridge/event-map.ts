@@ -1,9 +1,11 @@
 /**
  * 宿主会话事件 → 线协议推送载荷的映射(纯函数)。
  *
- * 输入是 session/event 的 SessionEvent 对象(结构类型,见 SessionEventLike);
- * 只提取客户端关心的语义事件,assistant/tool 载荷做了扁平化映射。
- * 无法识别或仅日志类的事件返回 null(静默忽略),保证宿主事件演进不破坏协议。
+ * 一个宿主事件可能产出**多条**线协议事件(例如 `assistant/message` 同时带思考与正文,
+ * 需按顺序分别推送),因此返回数组;空数组表示该事件不推给客户端。
+ *
+ * 只提取客户端关心的语义事件,无法识别或仅日志类的事件返回空数组,
+ * 保证宿主事件演进不破坏协议(前向兼容)。
  */
 
 /** 结构化的宿主 SessionEvent(最小依赖面)。 */
@@ -19,9 +21,15 @@ export interface SessionEventLike {
     name?: string
     arguments?: string
     error?: { name?: string; code?: string; message?: string }
+    todos?: unknown
+    active?: unknown
+    reason?: { kind?: string }
     [key: string]: unknown
   }
 }
+
+/** 一条线协议推送载荷。 */
+export type WirePayload = Record<string, unknown>
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -33,6 +41,18 @@ export function textOf(content: unknown): string | undefined {
   const parts: string[] = []
   for (const block of content) {
     if (isRecord(block) && block.type === 'text' && typeof block.text === 'string') {
+      parts.push(block.text)
+    }
+  }
+  return parts.length > 0 ? parts.join('') : undefined
+}
+
+/** 从 content block 数组里拼出思考文本(reasoning 块)。 */
+export function reasoningOf(content: unknown): string | undefined {
+  if (!Array.isArray(content)) return undefined
+  const parts: string[] = []
+  for (const block of content) {
+    if (isRecord(block) && block.type === 'reasoning' && typeof block.text === 'string') {
       parts.push(block.text)
     }
   }
@@ -77,46 +97,75 @@ function errorTextOf(content: unknown): string | undefined {
   return parts.length > 0 ? parts.join('; ') : undefined
 }
 
+/** 把宿主 todo 列表规整成线协议形状(丢弃形状不符的项)。 */
+function todosOf(raw: unknown): { content: string; status: string }[] | undefined {
+  if (!Array.isArray(raw)) return undefined
+  const todos: { content: string; status: string }[] = []
+  for (const item of raw) {
+    if (!isRecord(item) || typeof item.content !== 'string') continue
+    const status = typeof item.status === 'string' ? item.status : 'pending'
+    todos.push({ content: item.content, status })
+  }
+  return todos
+}
+
 /**
- * 把一条 SessionEvent 映射成推送载荷。
- * @returns 载荷对象(含 kind),无法识别的事件返回 null。
+ * 把一条 SessionEvent 映射成 0..n 条推送载荷。
+ *
+ * 顺序即客户端应呈现的顺序:思考(reasoning)先于正文(assistant.message)。
  */
-export function mapSessionEvent(event: SessionEventLike): Record<string, unknown> | null {
+export function mapSessionEvent(event: SessionEventLike): WirePayload[] {
   const { data } = event
+
   switch (event.type) {
     case 'assistant/message': {
       const message = isRecord(data) ? data.message : undefined
       const content = isRecord(message) ? message.content : undefined
-      const payload: Record<string, unknown> = { kind: 'assistant.message' }
+      const { turn, step } = data ?? {}
+      const turnStep = {
+        ...(typeof turn === 'number' ? { turn } : {}),
+        ...(typeof step === 'number' ? { step } : {}),
+      }
+
+      const out: WirePayload[] = []
+      // 思考先于正文:客户端可先渲染思考区,再渲染回复
+      const reasoning = reasoningOf(content)
+      if (reasoning) out.push({ kind: 'assistant.reasoning', text: reasoning, ...turnStep })
+
+      const payload: WirePayload = { kind: 'assistant.message' }
       const text = textOf(content)
       if (text) payload.text = text
       const calls = toolCallsOf(content)
       if (calls) payload.toolCalls = calls
-      // reasoning 块文本(content.type === 'reasoning')
-      if (Array.isArray(content)) {
-        const reasoning: string[] = []
-        for (const block of content) {
-          if (isRecord(block) && block.type === 'reasoning' && typeof block.text === 'string') {
-            reasoning.push(block.text)
-          }
-        }
-        if (reasoning.length > 0) payload.reasoningText = reasoning.join('')
-      }
-      const { turn, step } = data ?? {}
-      if (typeof turn === 'number') payload.turn = turn
-      if (typeof step === 'number') payload.step = step
-      return payload
+      Object.assign(payload, turnStep)
+      out.push(payload)
+      return out
     }
+
     case 'assistant/chunk': {
       const { turn, step } = data ?? {}
-      const payload: Record<string, unknown> = { kind: 'assistant.chunk', chunk: data?.chunk ?? data }
-      if (typeof turn === 'number') payload.turn = turn
-      if (typeof step === 'number') payload.step = step
-      return payload
+      const chunk = data?.chunk
+      const turnStep = {
+        ...(typeof turn === 'number' ? { turn } : {}),
+        ...(typeof step === 'number' ? { step } : {}),
+      }
+      // 思考增量用独立 kind,便于客户端单独做流式思考区
+      if (isRecord(chunk) && chunk.type === 'reasoning-delta') {
+        return [
+          {
+            kind: 'assistant.reasoning-chunk',
+            ...(typeof chunk.index === 'number' ? { index: chunk.index } : {}),
+            ...(typeof chunk.text === 'string' ? { text: chunk.text } : {}),
+            ...turnStep,
+          },
+        ]
+      }
+      return [{ kind: 'assistant.chunk', chunk: chunk ?? data, ...turnStep }]
     }
+
     case 'tool/call': {
       const { callId, name, arguments: args, turn, step } = data ?? {}
-      const payload: Record<string, unknown> = {
+      const payload: WirePayload = {
         kind: 'tool.call',
         callId: typeof callId === 'string' ? callId : '',
         name: typeof name === 'string' ? name : '',
@@ -124,39 +173,57 @@ export function mapSessionEvent(event: SessionEventLike): Record<string, unknown
       }
       if (typeof turn === 'number') payload.turn = turn
       if (typeof step === 'number') payload.step = step
-      return payload
+      return [payload]
     }
+
     case 'tool/result': {
       const { message, error, turn, step } = data ?? {}
-      const block = isRecord(message) && Array.isArray(message.content)
-        ? (message.content as unknown[]).find(
-            (item) => isRecord(item) && item.type === 'tool-result',
-          )
-        : undefined
+      const block =
+        isRecord(message) && Array.isArray(message.content)
+          ? (message.content as unknown[]).find((item) => isRecord(item) && item.type === 'tool-result')
+          : undefined
       const content = isRecord(block) ? block.content : undefined
       const isError = (isRecord(block) && block.isError === true) || isRecord(error)
-      const payload: Record<string, unknown> = {
+      const payload: WirePayload = {
         kind: 'tool.result',
-        callId: typeof (isRecord(block) ? block.toolCallId : undefined) === 'string'
-          ? (block as { toolCallId: string }).toolCallId
-          : '',
+        callId:
+          isRecord(block) && typeof block.toolCallId === 'string' ? block.toolCallId : '',
         ok: !isError,
       }
       const text = textOf(content) ?? errorTextOf(content)
       if (text) payload.text = text
       if (isRecord(error)) {
-        payload.error = {
-          name: error.name,
-          code: error.code,
-          message: error.message,
-        }
+        payload.error = { name: error.name, code: error.code, message: error.message }
       }
       if (typeof turn === 'number') payload.turn = turn
       if (typeof step === 'number') payload.step = step
-      return payload
+      return [payload]
     }
+
+    // ── 「当前在做什么」结构 ──────────────────────────────────────────────────
+
+    case 'todo/write': {
+      const todos = todosOf(data?.todos)
+      return todos === undefined ? [] : [{ kind: 'session.todo', todos }]
+    }
+
+    case 'plan/mode': {
+      // pending 需投影,由 registry 侧富化;事件本身只有 active
+      if (typeof data?.active !== 'boolean') return []
+      return [{ kind: 'session.plan', active: data.active }]
+    }
+
+    case 'turn/start':
+      return typeof data?.turn === 'number' ? [{ kind: 'session.turn', turn: data.turn, phase: 'start' }] : []
+
+    case 'turn/end': {
+      if (typeof data?.turn !== 'number') return []
+      const reason = isRecord(data.reason) && typeof data.reason.kind === 'string' ? data.reason.kind : undefined
+      return [{ kind: 'session.turn', turn: data.turn, phase: 'end', ...(reason ? { reason } : {}) }]
+    }
+
     default:
-      // user/message、turn/step/*、request/*、approval/*、session/end-seed 等不推给客户端
-      return null
+      // user/message、step/*、request/*、approval/*、session/end-seed 等不推给客户端
+      return []
   }
 }

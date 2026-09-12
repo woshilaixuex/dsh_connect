@@ -11,14 +11,15 @@ import { FakeConn, makeLogger, tick } from './helpers.js'
 /** 记录调用的假注册表。 */
 function makeRegistry(overrides: Partial<SessionRegistry> = {}) {
   const calls = {
-    ensure: [] as string[],
+    ensure: [] as { sessionId: string; cwd?: string }[],
     send: [] as { sessionId: string; prompt: string; chunks?: boolean }[],
     stop: [] as string[],
     release: [] as string[],
+    respondApproval: [] as { sessionId: string; pendingId: string; allow: boolean }[],
   }
   const registry: SessionRegistry = {
-    async ensure(sessionId) {
-      calls.ensure.push(sessionId)
+    async ensure(sessionId, cwd) {
+      calls.ensure.push(cwd === undefined ? { sessionId } : { sessionId, cwd })
     },
     async send(sessionId, prompt, options): Promise<SendResult> {
       calls.send.push({ sessionId, prompt, chunks: options?.chunks })
@@ -33,6 +34,10 @@ function makeRegistry(overrides: Partial<SessionRegistry> = {}) {
     },
     history: () => undefined,
     liveIds: () => [],
+    respondApproval(sessionId, pendingId, allow) {
+      calls.respondApproval.push({ sessionId, pendingId, allow })
+      return false
+    },
     async disposeAll() {},
     ...overrides,
   }
@@ -43,25 +48,67 @@ function req(id: string, code: string, payload?: unknown): ReqFrame {
   return { v: 1, kind: 'req', id, code, ...(payload === undefined ? {} : { payload: payload as never }) }
 }
 
+/** 假宿主会话读取:默认「宿主什么都没有」,可按用例注入。 */
+function makeHostReader(init: {
+  host?: import('../src/sessions/session-mirror.js').HostSessionRecord[]
+  titles?: Map<string, string>
+  existIds?: string[]
+} = {}) {
+  const host = init.host ?? []
+  const titles = init.titles ?? new Map<string, string>()
+  const existIds = new Set(init.existIds ?? [])
+  const calls = { exists: [] as string[] }
+  const reader: import('../src/sessions/host-sessions.js').HostSessionReader = {
+    async list() {
+      return host
+    },
+    async titles() {
+      return titles
+    },
+    async exists(sessionId) {
+      calls.exists.push(sessionId)
+      return existIds.has(sessionId)
+    },
+  }
+  return { reader, calls }
+}
+
 let hub: ReturnType<typeof createHub>
 let conn: FakeConn
 let index: SessionIndex
 let calls: ReturnType<typeof makeRegistry>['calls']
 let host: HostCtx
+let hostReaderCalls: ReturnType<typeof makeHostReader>['calls']
 
-function setupRegistry(overrides: Partial<SessionRegistry> = {}, hostOverrides: Partial<HostCtx> = {}): void {
+function setupRegistry(
+  overrides: Partial<SessionRegistry> = {},
+  options: {
+    hostOverrides?: Partial<HostCtx>
+    hostReader?: ReturnType<typeof makeHostReader>
+    indexInit?: () => SessionIndex
+  } = {},
+): void {
   hub = createHub(makeLogger())
   conn = new FakeConn()
-  index = createMemorySessionIndex()
+  index = options.indexInit ? options.indexInit() : createMemorySessionIndex()
   const made = makeRegistry(overrides)
   calls = made.calls
   host = {
     get: () => undefined,
     on: () => {},
     off: () => {},
-    ...hostOverrides,
+    ...options.hostOverrides,
   }
-  registerSessionTask({ host, hub, logger: makeLogger(), index, registry: made.registry })
+  const hostReader = options.hostReader ?? makeHostReader()
+  hostReaderCalls = hostReader.calls
+  registerSessionTask({
+    host,
+    hub,
+    logger: makeLogger(),
+    index,
+    registry: made.registry,
+    hostReader: hostReader.reader,
+  })
 }
 
 beforeEach(() => {
@@ -77,17 +124,53 @@ async function resOf(id: string) {
 }
 
 describe('session.create', () => {
-  test('创建会话:登记索引并拉起 agent', async () => {
+  test('不传 id:生成 client- 前缀并标记 source=client', async () => {
     hub.dispatch(conn, req('r1', 'session.create', { title: '测试会话' }))
     const res = await resOf('r1')
     assert.equal(res.ok, true)
     if (!res.ok) return
-    const data = res.data as { sessionId: string; title: string; createdAt: number }
-    assert.ok(data.sessionId.startsWith('sess-'))
+    const data = res.data as { sessionId: string; source: string; reused: boolean; title?: string }
+    assert.ok(data.sessionId.startsWith('client-'), `expected client- prefix, got ${data.sessionId}`)
+    assert.equal(data.source, 'client')
+    assert.equal(data.reused, false)
     assert.equal(data.title, '测试会话')
-    assert.equal(typeof data.createdAt, 'number')
-    assert.deepEqual(calls.ensure, [data.sessionId])
+    assert.deepEqual(calls.ensure, [{ sessionId: data.sessionId }])
     assert.equal(index.get(data.sessionId)!.title, '测试会话')
+    assert.equal(index.get(data.sessionId)!.source, 'client')
+  })
+
+  test('传已有宿主会话 id:复用并标记 source=host', async () => {
+    setupRegistry({}, { hostReader: makeHostReader({ existIds: ['session-42'] }) })
+    hub.dispatch(conn, req('r1', 'session.create', { sessionId: 'session-42' }))
+    const res = await resOf('r1')
+    assert.equal(res.ok, true)
+    if (!res.ok) return
+    const data = res.data as { sessionId: string; source: string; reused: boolean }
+    assert.equal(data.sessionId, 'session-42')
+    assert.equal(data.source, 'host')
+    assert.equal(data.reused, true)
+    assert.deepEqual(hostReaderCalls.exists, ['session-42'])
+    // 复用也要拉起(注册表会走 resume 路径)
+    assert.deepEqual(calls.ensure, [{ sessionId: 'session-42' }])
+  })
+
+  test('传宿主没有的 id:用该 id 新建但标记 source=client', async () => {
+    setupRegistry({}, { hostReader: makeHostReader({ existIds: [] }) })
+    hub.dispatch(conn, req('r1', 'session.create', { sessionId: 'client-custom-1' }))
+    const res = await resOf('r1')
+    assert.equal(res.ok, true)
+    if (!res.ok) return
+    const data = res.data as { sessionId: string; source: string; reused: boolean }
+    assert.equal(data.sessionId, 'client-custom-1')
+    assert.equal(data.source, 'client')
+    assert.equal(data.reused, false)
+  })
+
+  test('cwd 透传给注册表(便于挂进 workspace)', async () => {
+    hub.dispatch(conn, req('r1', 'session.create', { cwd: 'D:/proj' }))
+    const res = await resOf('r1')
+    assert.equal(res.ok, true)
+    assert.equal(calls.ensure[0]!.cwd, 'D:/proj')
   })
 
   test('拉起失败时回滚索引并报 agent.failed', async () => {
@@ -168,7 +251,7 @@ describe('session.history', () => {
       ],
     }
     const sessionQuery = { readSession: async () => persisted }
-    setupRegistry({}, { get: (key: string) => (key === 'sessionQuery' ? sessionQuery : undefined) })
+    setupRegistry({}, { hostOverrides: { get: (key: string) => (key === 'sessionQuery' ? sessionQuery : undefined) } })
     hub.dispatch(conn, req('r1', 'session.history', { sessionId: 'sess-y' }))
     const res = await resOf('r1')
     assert.equal(res.ok, true)
@@ -360,4 +443,46 @@ describe('注册/注销', () => {
 
 afterEach(() => {
   // 每个用例独立 hub/conn,无全局状态需要清理
+})
+
+describe('approval.respond', () => {
+  test('命中时返回 outcome=allowed-once', async () => {
+    setupRegistry({
+      respondApproval: (sessionId, pendingId, allow) => {
+        calls.respondApproval.push({ sessionId, pendingId, allow })
+        return true
+      },
+    })
+    hub.dispatch(conn, req('r1', 'approval.respond', { sessionId: 'sess-1', pendingId: 'approve-1', allow: true }))
+    const res = await resOf('r1')
+    assert.equal(res.ok, true)
+    if (!res.ok) return
+    assert.deepEqual(res.data, { pendingId: 'approve-1', outcome: 'allowed-once' })
+    assert.deepEqual(calls.respondApproval, [{ sessionId: 'sess-1', pendingId: 'approve-1', allow: true }])
+  })
+
+  test('reject 返回 outcome=rejected', async () => {
+    setupRegistry({ respondApproval: () => true })
+    hub.dispatch(conn, req('r1', 'approval.respond', { sessionId: 'sess-1', pendingId: 'approve-1', allow: false }))
+    const res = await resOf('r1')
+    assert.equal(res.ok, true)
+    if (!res.ok) return
+    assert.deepEqual(res.data, { pendingId: 'approve-1', outcome: 'rejected' })
+  })
+
+  test('未命中返回 approval.not.found', async () => {
+    hub.dispatch(conn, req('r1', 'approval.respond', { sessionId: 'sess-1', pendingId: 'approve-1', allow: true }))
+    const res = await resOf('r1')
+    assert.equal(res.ok, false)
+    if (res.ok) return
+    assert.equal(res.code, ErrorCodes.APPROVAL_NOT_FOUND)
+  })
+
+  test('字段缺失返回 bad.request', async () => {
+    hub.dispatch(conn, req('r1', 'approval.respond', { sessionId: 'sess-1', allow: true }))
+    const res = await resOf('r1')
+    assert.equal(res.ok, false)
+    if (res.ok) return
+    assert.equal(res.code, ErrorCodes.BAD_REQUEST)
+  })
 })

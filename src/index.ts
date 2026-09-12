@@ -40,8 +40,9 @@ export function apply(ctx: Context) {
   let sessionIndex: SessionIndex | undefined
   if (dbPath) {
     const store = openDatabase(ctx, dbPath)
-    sessionIndex = openSessionIndex(store.db)
-    ctx.logger('dsh-connect/store').info('sqlite database opened at %s', store.path)
+    const storeLogger = ctx.logger('dsh-connect/store')
+    sessionIndex = openSessionIndex(store.db, storeLogger)
+    storeLogger.info('sqlite database opened at %s', store.path)
     ctx.effect(
       () => () => {
         store.dispose()

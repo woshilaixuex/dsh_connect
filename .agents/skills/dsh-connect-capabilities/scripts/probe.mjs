@@ -196,6 +196,25 @@ async function main() {
     no('receiver:session.send', '未收到响应')
   }
 
+  // 10. 接收码 workspace.list(只读探测;报告走的是 registry 还是 cwd 兜底)
+  socket.send(JSON.stringify({ v: 1, kind: 'req', id: 'probe-workspaces', code: 'workspace.list', payload: {} }))
+  try {
+    const res = await router.res('probe-workspaces')
+    if (res.ok === true) {
+      const count = Array.isArray(res.data?.workspaces) ? res.data.workspaces.length : 0
+      ok('receiver:workspace.list', `已注册,source=${res.data?.source}(${count} 个工作区)`)
+      if (res.data?.source === 'cwd') {
+        info('workspace 提示', '宿主未挂 @deepseek-ai/dsh-workspace(bundle 里没有)→ 已按 cwd 兜底分组')
+      }
+    } else if (res.code === 'unknown.code') {
+      no('receiver:workspace.list', '未注册')
+    } else {
+      info('receiver:workspace.list', `响应 ${res.code}`)
+    }
+  } catch {
+    no('receiver:workspace.list', '未收到响应')
+  }
+
   socket.close()
 
   console.log('\n  说明:')

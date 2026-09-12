@@ -1,17 +1,60 @@
 # dsh-connect 线协议 v1(逐字段)
 
-服务端是 dsh 宿主里的插件(`dsh-dsh-connect`),在 `hostName:listenPort` 上提供 WebSocket。
-默认端口 **8097**(`DEFAULT_CONFIG.listenPort`);具体部署可能被 `.env` 覆盖(例如 `8080`),以服务端日志 `ws server listening on <host>:<port>` 为准。
+服务端是 dsh 宿主里的插件(`dsh-dsh-connect`),开**两个**监听:
+
+| 通道 | 默认端口 | 用途 |
+|---|---|---|
+| **HTTP(只读)** | **8098** | 取数据最省事:`GET /health` `/workspaces` `/sessions` `/sessions/:id/history` |
+| WebSocket(读 + 写) | 8097 | 发消息、建会话、删除;实时事件流 |
+
+两者都可能被 `.env` 覆盖(本机 WS 实际是 `8080`)。以服务端日志为准:
+`http server listening on <host>:<port>` / `ws server listening on <host>:<port>`。
+
+---
+
+## 0. HTTP 只读接口(取数据首选)
+
+独立端口,只读,`GET`/`HEAD`,CORS 全开(`Access-Control-Allow-Origin: *`),无鉴权。
+**写操作不在这里** —— 发消息/建会话/删除仍走 WS。
+
+| 路由 | 查询参数 | 响应 |
+|---|---|---|
+| `GET /health` | — | `{ ok, uptimeMs, sessions: { host, index, live }, workspaces: { source, count } }` |
+| `GET /workspaces` | `includeDeleted?` | `{ ok, source: 'registry'\|'cwd', workspaces: [{ workspaceId, path, title, sessionIds }] }` |
+| `GET /sessions` | `limit?`(默认 50,上限 1000)`offset?`(默认 0)`includeDeleted?` | `{ ok, sessions: [SessionSummary], meta }` |
+| `GET /sessions/:sessionId/history` | `limit?`(默认 100) | `{ ok, sessionId, source: 'memory'\|'persisted', messages: [{ role, text, ts }] }` |
+
+`SessionSummary` 与 WS 的同名结构一致(见 §3)。
+`includeDeleted` 接受 `1`/`true` 为真。
+
+约定:
+
+- 方法:`GET`/`HEAD` 放行;`OPTIONS` → `204`(预检);其它 → `405`。
+- 响应头:`Content-Type: application/json; charset=utf-8`、`Cache-Control: no-store`。
+- 错误体:`{ ok:false, code, message, status }`;`400` 参数非法、`404` 未知路由、`405` 方法不允许、`500` 内部错误。
+- 尾斜杠容忍(`/sessions/` 等价 `/sessions`)。
+- **无缓存**:服务端每次实时读宿主;会话多时较慢。实时事件没有 HTTP 版本,仍走 WS。
+
+```jsonc
+// GET /sessions?limit=2
+{"ok":true,"sessions":[{"sessionId":"client-x","source":"client","title":"…","cwd":"D:/p","createdAt":1,"updatedAt":2,"live":true,"persisted":true,"messageCount":4,"lastMessage":"…"}],"meta":{"limit":2,"offset":0,"includeDeleted":false,"hostCount":27,"indexCount":17,"returned":2}}
+
+// GET /sessions/client-x/history?limit=2
+{"ok":true,"sessionId":"client-x","source":"persisted","messages":[{"role":"user","text":"…","ts":1},{"role":"assistant","text":"…","ts":2}]}
+```
+
+---
+
+## 1. 帧信封(WebSocket)
+
+服务端在 `hostName:listenPort` 上提供 WebSocket。
+默认端口 **8097**;具体部署可能被 `.env` 覆盖(例如 `8080`),以服务端日志 `ws server listening on <host>:<port>` 为准。
 
 - 传输:WebSocket,帧一律 **UTF-8 JSON 文本**;二进制帧不受支持(回帧级 `err`)
 - 单帧上限 **256 KB**(`MAX_FRAME_BYTES`),超出回 `bad.size`
 - 协议版本字段 `v` 恒为 `1`;`v` 不为 1 → 帧级 `bad.frame`
 - **无鉴权**(局域网信任模型)
 - `id` / `code` / 推送码:非空字符串,长度 ≤ 128
-
----
-
-## 1. 帧信封
 
 每帧是 JSON 对象,必含 `v` 与 `kind`。
 
@@ -111,30 +154,49 @@ payload:`{ "taskId": string }`
 
 | code | payload | 成功 res.data |
 |---|---|---|
-| `session.create` | `{ title? }` | `{ sessionId, title?, createdAt }` |
+| `session.create` | `{ sessionId?, title?, cwd? }` | `{ sessionId, source, reused, title? }` |
 | `session.list` | `{ limit?, offset?, includeDeleted? }` | `{ sessions: [SessionSummary] }` |
 | `session.get` | `{ sessionId }` | `SessionSummary` |
 | `session.history` | `{ sessionId, limit? }` | `{ messages: [{ role, text, ts }] }` |
 | `session.send` | `{ sessionId, prompt, chunks? }` | `{ sessionId, status, durationMs, error? }` |
 | `session.stop` | `{ sessionId }` | `{ sessionId, status: 'stopped' }` |
 | `session.delete` | `{ sessionId }` | `{ sessionId, deleted: true }` |
+| `workspace.list` | `{ includeDeleted? }` | `{ source: 'registry'\|'cwd', workspaces: [{ workspaceId, path, title, sessionIds }] }` |
+| `approval.respond` | `{ sessionId, pendingId, allow: boolean }` | `{ pendingId, outcome: 'allowed-once'\|'rejected' }` |
 
-`SessionSummary` = `{ sessionId, title?, createdAt, lastActiveAt, lastMessage?, messageCount, live, deleted? }`(`live` = 当前是否有常驻 agent)
+`SessionSummary` = `{ sessionId, source: 'client'|'host', title?, cwd?, createdAt, updatedAt, live, persisted, messageCount?, lastMessage?, deleted? }`
 
-错误码:`session.not.found`、`session.resume-failed`、`bad.request`。
+错误码:`session.not.found`、`session.resume-failed`、`approval.not.found`、`bad.request`。
+
+**新建 / 复用**(`session.create`):
+
+| 传入 | 行为 | `source` |
+|---|---|---|
+| `sessionId`(宿主已有) | **复用**该会话(resume,上下文延续) | `'host'` |
+| `sessionId`(宿主没有) | 用该 id 新建 | `'client'` |
+| 不传 | 服务端生成 `client-<uuid>` | `'client'` |
+
+`reused: true` 表示复用了已有会话。
+
+**镜像宿主会话**:`session.list` 返回的是**宿主已有会话 ∪ 本插件会话**,所以能看到用户在 web UI 里建的会话(`source: 'host'`),标题来自宿主。
+宿主侧没有来源字段,`source` 由本插件索引维护。
 
 关键语义:
 
-- **`session.create` 把发起连接自动订阅** `session:<sessionId>`;观察**别人创建**的会话需自己 `sub`。
+- **`session.create` 与 `session.send` 都把发起连接自动订阅** `session:<sessionId>`;观察**别人创建**的会话需自己 `sub`。
 - 同一会话的消息**串行执行**;不同会话并行。
 - `session.stop` 只打断当前轮,**保留会话**;`session.delete` 是**软删**(宿主无删除 API,只从列表隐藏)。
+- 传 `cwd` 建会话才会归属到工作区(不传则落宿主 `_no-cwd` 桶,不出现在任何 workspace 里)。
 - 历史里可能含宿主注入的上下文(`<system-reminder>` 等),客户端可按需过滤。
 
 ```jsonc
-{"v":1,"kind":"req","id":"c1","code":"session.create","payload":{"title":"我的会话"}}
-{"v":1,"kind":"req","id":"s1","code":"session.send","payload":{"sessionId":"sess-xxx","prompt":"记住:我叫蓝鲸"}}
-{"v":1,"kind":"req","id":"s2","code":"session.send","payload":{"sessionId":"sess-xxx","prompt":"我叫什么?"}}   // agent 记得
-{"v":1,"kind":"req","id":"h1","code":"session.history","payload":{"sessionId":"sess-xxx","limit":50}}
+// 复用宿主已有会话
+{"v":1,"kind":"req","id":"c1","code":"session.create","payload":{"sessionId":"session-42"}}
+// 新建客户端会话(带 cwd 以便归属工作区)
+{"v":1,"kind":"req","id":"c2","code":"session.create","payload":{"title":"我的会话","cwd":"D:/proj"}}
+{"v":1,"kind":"req","id":"s1","code":"session.send","payload":{"sessionId":"client-xxx","prompt":"记住:我叫蓝鲸"}}
+{"v":1,"kind":"req","id":"s2","code":"session.send","payload":{"sessionId":"client-xxx","prompt":"我叫什么?"}}   // agent 记得
+{"v":1,"kind":"req","id":"w1","code":"workspace.list","payload":{}}
 ```
 
 ---
@@ -148,9 +210,14 @@ payload:`{ "taskId": string }`
 | kind | 字段 | 说明 |
 |---|---|---|
 | `agent.status` | `status`:`"running"` \| `"idle"` | agent 生命周期 |
-| `assistant.message` | `text?`,`reasoningText?`,`toolCalls?:[{id,name,arguments}]`,`turn?`,`step?` | 一次完整助手回复;`arguments` 是**原始 JSON 字符串**,需自行 parse |
+| `session.turn` | `turn`,`phase`:`"start"`\|`"end"`,`reason?` | 轮次边界,可渲染阶段 |
+| `session.todo` | `todos:[{content,status}]` | 模型的待办清单(整体替换);`status` ∈ `pending`/`in_progress`/`completed` |
+| `session.plan` | `active`,`pending?` | 计划模式状态 |
+| `assistant.reasoning` | `text`,`turn?`,`step?` | **完整思考过程**;顺序在 `assistant.message` 之前 |
+| `assistant.reasoning-chunk` | `index?`,`text?`,`turn?`,`step?` | 思考的流式增量,**仅 `chunks:true`** |
+| `assistant.message` | `text?`,`toolCalls?:[{id,name,arguments}]`,`turn?`,`step?` | 一次完整助手回复;`arguments` 是**原始 JSON 字符串**,需自行 parse |
 | `assistant.chunk` | `chunk`,`turn?`,`step?` | **仅 `chunks:true`**;`chunk.type`:`text-delta` \| `reasoning-delta` \| `tool-call-delta` \| `block-start` \| `block-end` \| `usage` \| `finish` |
-| `tool.call` | `callId`,`name`,`arguments`,`turn?`,`step?` | 工具调用开始;`arguments` 原始 JSON 字符串 |
+| `tool.call` | `callId`,`name`,`arguments`,`label?`,`turn?`,`step?` | `label` 是宿主给的人类可读标题(可能缺失);`arguments` 原始 JSON 字符串 |
 | `tool.result` | `callId`,`ok`,`text?`,`error?:{name?,code?,message?}`,`turn?`,`step?` | 工具结果;`ok:false` 时看 `error` |
 | `agent.error` | `message` | agent 异步失败信号(最终 res 的 `status` 会是 `failed`) |
 
@@ -161,6 +228,13 @@ payload:`{ "taskId": string }`
 | kind | 字段 | 说明 |
 |---|---|---|
 | `session.user-message` | `text` | 会话内某条用户输入的回显(多端同步用;自己发的那条也会收到) |
+| `session.approval` | `pendingId`,`toolName`,`callId?`,`reason?` | **权限请求**:宿主需要批准才执行某操作(sandbox 升级、`ask` 工具调用)。客户端应弹确认框,回 `approval.respond` |
+
+**审批流程**:收到 `session.approval` → UI 展示 `toolName`/`reason` → 用户点「允许/拒绝」→ 发 `approval.respond {sessionId, pendingId, allow}`。
+`allow=true` = 本次授予(`allowed-once`);`false` = 拒绝。**先到先得**,多个订阅者里第一个合法回复生效,其余拿到 `approval.not.found`。
+**超时兜底**:客户端不回复,服务端超时(默认 120s)自动拒绝,不会把 agent 卡死。宿主**没有「始终允许」**,每次审批都要单独回复。
+
+**渲染建议**:`session.todo` 适合做任务清单面板;`assistant.reasoning` / `assistant.reasoning-chunk` 适合做可折叠的「思考区」;`tool.call.label` 可直接当工具行的标题(缺失时退回 `name`)。
 
 前向兼容:**未知 `kind` 一律忽略**,不要报错。
 

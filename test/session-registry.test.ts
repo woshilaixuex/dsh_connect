@@ -86,9 +86,11 @@ interface Harness {
   opened: Opened[]
   emitSession(sessionId: string, event: SessionEventLike): void
   emitAgentError(sessionId: string, error: unknown): void
+  /** 触发一次审批请求,返回 answerer 的返回值(应是 Promise<outcome>)。 */
+  emitApproval(req: unknown): unknown[]
 }
 
-function makeHarness(options: { resumeFails?: boolean; idleTimeoutMs?: number; loadHistory?: (id: string) => Promise<WireMessage[]> } = {}): Harness {
+function makeHarness(options: { resumeFails?: boolean; idleTimeoutMs?: number; approvalTimeoutMs?: number; loadHistory?: (id: string) => Promise<WireMessage[]> } = {}): Harness {
   const listeners = new Map<string, Set<(...args: unknown[]) => void>>()
   const host: HostCtx = {
     get: () => undefined,
@@ -115,6 +117,7 @@ function makeHarness(options: { resumeFails?: boolean; idleTimeoutMs?: number; l
   const { adapter, opened } = makeAdapter(options)
   const registry = createSessionRegistry(host, hub, adapter, index, makeLogger(), {
     idleTimeoutMs: options.idleTimeoutMs ?? 60_000,
+    approvalTimeoutMs: options.approvalTimeoutMs ?? 60_000,
     ...(options.loadHistory === undefined ? {} : { loadHistory: options.loadHistory }),
   })
 
@@ -126,6 +129,13 @@ function makeHarness(options: { resumeFails?: boolean; idleTimeoutMs?: number; l
     opened,
     emitSession: (sessionId, event) => fire('session/event', { id: sessionId }, event),
     emitAgentError: (sessionId, error) => fire('agent/error', { agent: { id: sessionId }, error }),
+    emitApproval: (req) => {
+      const results: unknown[] = []
+      for (const handler of [...(listeners.get('approval/request') ?? [])]) {
+        results.push(handler(req, async () => 'unavailable'))
+      }
+      return results
+    },
   }
 }
 
@@ -411,5 +421,108 @@ describe('内存历史', () => {
     harness.opened[1]!.agent.settle()
     await second
     assert.deepEqual(harness.registry.history('sess-1')!.map((m) => m.text), ['二'])
+  })
+})
+
+describe('审批桥接', () => {
+  test('认领我们的 agent 的审批并推送给订阅者,allow 回传 allowed-once', async () => {
+    const harness = makeHarness()
+    await harness.registry.ensure('sess-1')
+    harness.conn.frames.length = 0
+    const results = harness.emitApproval({
+      agent: { id: 'sess-1' },
+      toolName: 'pwsh',
+      callId: 'call-1',
+      reason: '需要写入工作区外',
+    })
+    assert.equal(results.length, 1)
+    const pending = results[0] as Promise<string>
+    const evt = harness.conn.frames.find(
+      (f) => f.kind === 'evt' && (f as { data?: { kind?: string } }).data?.kind === 'session.approval',
+    )
+    assert.ok(evt)
+    const data = (evt as { data: Record<string, unknown> }).data
+    assert.equal(data.toolName, 'pwsh')
+    assert.equal(data.callId, 'call-1')
+    assert.equal(data.reason, '需要写入工作区外')
+    assert.ok(typeof data.pendingId === 'string')
+    assert.equal(harness.registry.respondApproval('sess-1', data.pendingId as string, true), true)
+    assert.equal(await pending, 'allowed-once')
+  })
+
+  test('reject 回传 rejected', async () => {
+    const harness = makeHarness()
+    await harness.registry.ensure('sess-1')
+    const results = harness.emitApproval({ agent: { id: 'sess-1' }, toolName: 'pwsh' })
+    const pending = results[0] as Promise<string>
+    const data = (harness.conn.frames.find((f) => f.kind === 'evt') as { data: Record<string, unknown> }).data
+    assert.equal(harness.registry.respondApproval('sess-1', data.pendingId as string, false), true)
+    assert.equal(await pending, 'rejected')
+  })
+
+  test('sessionId 不匹配不认领,仍可正确回复', async () => {
+    const harness = makeHarness()
+    await harness.registry.ensure('sess-1')
+    const results = harness.emitApproval({ agent: { id: 'sess-1' }, toolName: 'pwsh' })
+    const pending = results[0] as Promise<string>
+    const data = (harness.conn.frames.find((f) => f.kind === 'evt') as { data: Record<string, unknown> }).data
+    assert.equal(harness.registry.respondApproval('sess-2', data.pendingId as string, true), false)
+    assert.equal(harness.registry.respondApproval('sess-1', data.pendingId as string, false), true)
+    assert.equal(await pending, 'rejected')
+  })
+
+  test('非我们 agent 的审批委托给 next()', async () => {
+    const harness = makeHarness()
+    await harness.registry.ensure('sess-1')
+    const results = harness.emitApproval({ agent: { id: 'other-agent' }, toolName: 'pwsh' })
+    const pending = results[0] as Promise<string>
+    assert.equal(await pending, 'unavailable')
+    assert.equal(harness.conn.frames.filter((f) => f.kind === 'evt').length, 0)
+  })
+
+  test('客户端不回复时超时自动 reject', async () => {
+    const harness = makeHarness({ approvalTimeoutMs: 20 })
+    await harness.registry.ensure('sess-1')
+    const results = harness.emitApproval({ agent: { id: 'sess-1' }, toolName: 'pwsh' })
+    const pending = results[0] as Promise<string>
+    // 用 ref'd 计时器保持事件循环,给 unref 的超时 timer 触发机会(同空闲回收测试)
+    await new Promise((resolve) => setTimeout(resolve, 60))
+    assert.equal(await pending, 'rejected')
+  })
+
+  test('宿主 signal abort 时取消', async () => {
+    const aborts: (() => void)[] = []
+    const signal = {
+      addEventListener: (type: string, fn: () => void) => {
+        if (type === 'abort') aborts.push(fn)
+      },
+      removeEventListener: () => {},
+    }
+    const harness = makeHarness()
+    await harness.registry.ensure('sess-1')
+    const results = harness.emitApproval({ agent: { id: 'sess-1' }, toolName: 'pwsh', signal })
+    const pending = results[0] as Promise<string>
+    aborts[0]!()
+    assert.equal(await pending, 'cancelled')
+  })
+
+  test('release 时未决审批取消', async () => {
+    const harness = makeHarness()
+    await harness.registry.ensure('sess-1')
+    const results = harness.emitApproval({ agent: { id: 'sess-1' }, toolName: 'pwsh' })
+    const pending = results[0] as Promise<string>
+    await harness.registry.release('sess-1')
+    assert.equal(await pending, 'cancelled')
+  })
+
+  test('disposeAll 时未决审批取消并卸载 answerer', async () => {
+    const harness = makeHarness()
+    await harness.registry.ensure('sess-1')
+    const results = harness.emitApproval({ agent: { id: 'sess-1' }, toolName: 'pwsh' })
+    const pending = results[0] as Promise<string>
+    await harness.registry.disposeAll()
+    assert.equal(await pending, 'cancelled')
+    // 卸载后不再有 answerer 响应
+    assert.deepEqual(harness.emitApproval({ agent: { id: 'sess-1' }, toolName: 'pwsh' }), [])
   })
 })

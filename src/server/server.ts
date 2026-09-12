@@ -29,6 +29,8 @@ import { registerSessionTask } from '../tasks/session-task.js'
 import { createMemorySessionIndex, type SessionIndex } from '../sessions/session-index.js'
 import { createSessionRegistry } from '../sessions/session-registry.js'
 import { readPersistedHistory } from '../sessions/persisted-history.js'
+import { createHostSessionReader } from '../sessions/host-sessions.js'
+import { createHttpServer } from '../http/http-server.js'
 
 /** ws message 的 data 可能有 Buffer / ArrayBuffer / Buffer[] 三种形态,统一成 Buffer。 */
 function toBuffer(data: RawData): Buffer {
@@ -44,6 +46,8 @@ export interface ProxyServer {
   hub: Hub
   /** 监听就绪后的实际端口(配置 listenPort 0 时用于获取随机端口)。 */
   port: Promise<number>
+  /** HTTP 只读接口的实际端口(-1 表示已禁用)。 */
+  httpPort: Promise<number>
 }
 
 export interface ServerDeps {
@@ -66,25 +70,47 @@ export function createServer(ctx: Context, config: Config, deps: ServerDeps = {}
     }),
   )
 
+  // 会话索引与宿主读取器:WS 与 HTTP 共用,所以放在 adapter 判定之外
+  // (HTTP 在无 agent 服务时仍应能列宿主会话并读历史)
+  const sessionIndex = deps.sessionIndex ?? createMemorySessionIndex()
+  const hostReader = createHostSessionReader(host, ctx.logger('dsh-connect/host'))
+
   // 会话能力:依赖宿主 agent 服务;没有则只注册一次性任务
   const adapter = detectAgentAdapter(host)
   if (adapter) {
-    const sessionIndex = deps.sessionIndex ?? createMemorySessionIndex()
     const sessionLogger = ctx.logger('dsh-connect/session')
     registry = createSessionRegistry(host, hub, adapter, sessionIndex, sessionLogger, {
       idleTimeoutMs: config.sessionIdleTimeoutMs,
+      approvalTimeoutMs: config.approvalTimeoutMs,
       provider: config.agentProvider,
       model: config.agentModel,
       // resume 后补齐历史(否则恢复的会话只有 resume 之后的消息)
       loadHistory: (sessionId) => readPersistedHistory(host, sessionId),
+      // 用宿主存在性判定 resume/create(对已持久化 id 直接 create 会异步碰撞)
+      probeSession: (sessionId) => hostReader.exists(sessionId),
     })
     disposers.push(
-      registerSessionTask({ host, hub, logger: sessionLogger, index: sessionIndex, registry }),
+      registerSessionTask({
+        host,
+        hub,
+        logger: sessionLogger,
+        index: sessionIndex,
+        registry,
+        hostReader,
+      }),
     )
     logger.info('session capability enabled (idle timeout %dms)', config.sessionIdleTimeoutMs)
   } else {
     logger.warn('no host agent service — session.* receivers not registered')
   }
+
+  // HTTP 只读接口(独立端口;失败不影响 WS)
+  const httpServer = createHttpServer(ctx, config, {
+    host,
+    hostReader,
+    sessionIndex,
+    ...(registry === undefined ? {} : { registry }),
+  })
 
   const wss = new WebSocketServer({
     host: config.hostName,
@@ -178,6 +204,7 @@ export function createServer(ctx: Context, config: Config, deps: ServerDeps = {}
   return {
     hub,
     port,
+    httpPort: httpServer.port,
     dispose: async () => {
       if (disposed) return
       disposed = true
@@ -187,6 +214,12 @@ export function createServer(ctx: Context, config: Config, deps: ServerDeps = {}
         } catch (error) {
           logger.warn('dispose receiver failed: %o', error)
         }
+      }
+      // 先停 HTTP(不再接新请求),再释放会话
+      try {
+        await httpServer.dispose()
+      } catch (error) {
+        logger.warn('dispose http server failed: %o', error)
       }
       // 会话常驻 agent 与宿主监听统一释放
       if (registry) {

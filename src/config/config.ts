@@ -17,6 +17,11 @@ export interface Config {
   hostName: string
   /** WS 监听端口 */
   listenPort: number
+  /**
+   * HTTP 只读接口端口(与 WS 分离)。
+   * 0 = 随机端口(e2e 用);-1 = 禁用 HTTP 接口。
+   */
+  httpPort: number
   logLevel: LogLevel
   /** 日志信息记录，DEV和DEBUG都会做持久化 */
   logPath?: string
@@ -33,6 +38,8 @@ export interface Config {
   agentModel?: string
   /** 会话空闲回收阈值(ms):超过则 dispose 常驻 agent,会话本身留在宿主。 */
   sessionIdleTimeoutMs: number
+  /** 审批请求超时(ms):客户端不回复时自动拒绝(失败关闭)。 */
+  approvalTimeoutMs: number
 }
 /**
  * 默认配置，做配置加载降级兜底
@@ -40,8 +47,10 @@ export interface Config {
 export const DEFAULT_CONFIG: Config = {
   hostName: '0.0.0.0',
   listenPort: 8097,
+  httpPort: 8098,
   logLevel: LogLevel.DEV,
   sessionIdleTimeoutMs: 10 * 60 * 1000,
+  approvalTimeoutMs: 120 * 1000,
 }
 
 /** 本地配置文件路径,可用 env DSH_CONNECT_CONFIG 覆盖。 */
@@ -102,14 +111,26 @@ function parsePort(value: string | undefined): number {
 }
 
 /** 解析毫秒时长;非法/非正数回退默认。 */
-function parseDuration(value: string | undefined): number {
-  if (!value) return DEFAULT_CONFIG.sessionIdleTimeoutMs
+function parseDuration(value: string | undefined, fallbackMs: number): number {
+  if (!value) return fallbackMs
   const ms = Number(value)
   if (!Number.isFinite(ms) || ms <= 0) {
-    console.warn(`[dsh-connect] 非法时长 "${value}",回退 ${DEFAULT_CONFIG.sessionIdleTimeoutMs}ms`)
-    return DEFAULT_CONFIG.sessionIdleTimeoutMs
+    console.warn(`[dsh-connect] 非法时长 "${value}",回退 ${fallbackMs}ms`)
+    return fallbackMs
   }
   return ms
+}
+
+/** 解析 HTTP 端口;除常规端口外,额外允许 -1(禁用)。 */
+function parseHttpPort(value: string | undefined): number {
+  if (!value) return DEFAULT_CONFIG.httpPort
+  if (value.trim() === '-1') return -1
+  const port = Number(value)
+  if (!Number.isInteger(port) || port < 0 || port > 65535) {
+    console.warn(`[dsh-connect] 非法 HTTP 端口 "${value}",回退 ${DEFAULT_CONFIG.httpPort}`)
+    return DEFAULT_CONFIG.httpPort
+  }
+  return port
 }
 
 function readConfigFile(): Partial<Config> {
@@ -137,6 +158,8 @@ function readEnv(): Partial<Config> {
   if (hostName) env.hostName = hostName
   const port = process.env[`${ENV_PREFIX}PORT`]
   if (port) env.listenPort = parsePort(port)
+  const httpPort = process.env[`${ENV_PREFIX}HTTP_PORT`]
+  if (httpPort) env.httpPort = parseHttpPort(httpPort)
   const logLevel = process.env[`${ENV_PREFIX}LOG_LEVEL`]
   if (logLevel) env.logLevel = parseLogLevel(logLevel)
   const logPath = process.env[`${ENV_PREFIX}LOG_PATH`]
@@ -149,7 +172,9 @@ function readEnv(): Partial<Config> {
   const agentModel = process.env[`${ENV_PREFIX}AGENT_MODEL`]
   if (agentModel) env.agentModel = agentModel
   const idleMs = process.env[`${ENV_PREFIX}SESSION_IDLE_MS`]
-  if (idleMs) env.sessionIdleTimeoutMs = parseDuration(idleMs)
+  if (idleMs) env.sessionIdleTimeoutMs = parseDuration(idleMs, DEFAULT_CONFIG.sessionIdleTimeoutMs)
+  const approvalMs = process.env[`${ENV_PREFIX}APPROVAL_TIMEOUT_MS`]
+  if (approvalMs) env.approvalTimeoutMs = parseDuration(approvalMs, DEFAULT_CONFIG.approvalTimeoutMs)
   return env
 }
 

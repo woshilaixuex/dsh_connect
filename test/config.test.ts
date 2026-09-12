@@ -17,7 +17,7 @@ import {
  */
 
 const ENV_KEYS = [
-  'DSH_CONNECT_HOST', 'DSH_CONNECT_HOSTNAME', 'DSH_CONNECT_PORT',
+  'DSH_CONNECT_HOST', 'DSH_CONNECT_HOSTNAME', 'DSH_CONNECT_PORT', 'DSH_CONNECT_HTTP_PORT',
   'DSH_CONNECT_LOG_LEVEL', 'DSH_CONNECT_LOG_PATH', 'DSH_CONNECT_DB_PATH',
   'DSH_CONNECT_AGENT_PROVIDER', 'DSH_CONNECT_AGENT_MODEL',
   'DSH_CONNECT_CONFIG', 'DSH_CONNECT_DOTENV',
@@ -102,6 +102,31 @@ describe('环境变量解析', () => {
     const config = getConfig()
     assert.equal(config.agentProvider, 'deepseek-official')
     assert.equal(config.agentModel, 'deepseek-v4-flash')
+  })
+
+  test('DSH_CONNECT_HTTP_PORT 覆盖 HTTP 端口', () => {
+    process.env.DSH_CONNECT_HTTP_PORT = '9100'
+    assert.equal(getConfig().httpPort, 9100)
+  })
+
+  test('DSH_CONNECT_HTTP_PORT=-1 表示禁用', () => {
+    process.env.DSH_CONNECT_HTTP_PORT = '-1'
+    assert.equal(getConfig().httpPort, -1)
+  })
+
+  test('非法 HTTP 端口回退默认', () => {
+    process.env.DSH_CONNECT_HTTP_PORT = 'not-a-port'
+    assert.equal(getConfig().httpPort, DEFAULT_CONFIG.httpPort)
+  })
+
+  test('DSH_CONNECT_APPROVAL_TIMEOUT_MS 覆盖审批超时', () => {
+    process.env.DSH_CONNECT_APPROVAL_TIMEOUT_MS = '30000'
+    assert.equal(getConfig().approvalTimeoutMs, 30000)
+  })
+
+  test('非法审批超时回退默认', () => {
+    process.env.DSH_CONNECT_APPROVAL_TIMEOUT_MS = 'not-a-number'
+    assert.equal(getConfig().approvalTimeoutMs, DEFAULT_CONFIG.approvalTimeoutMs)
   })
 })
 

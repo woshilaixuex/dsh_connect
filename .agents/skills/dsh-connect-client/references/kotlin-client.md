@@ -98,13 +98,24 @@ data class WireMessage(
 /** 会话摘要。 */
 data class SessionSummary(
     val sessionId: String,
+    val source: String,       // "client"(本插件为客户端建) | "host"(宿主已有)
     val title: String?,
+    val cwd: String?,
     val createdAt: Long,
-    val lastActiveAt: Long,
-    val lastMessage: String?,
-    val messageCount: Int,
+    val updatedAt: Long,
     val live: Boolean,        // 当前是否有常驻 agent
+    val persisted: Boolean,
+    val messageCount: Int?,
+    val lastMessage: String?,
     val deleted: Boolean,
+)
+
+/** 工作区。 */
+data class WorkspaceView(
+    val workspaceId: String,
+    val path: String,
+    val title: String,
+    val sessionIds: List<String>,
 )
 
 fun JsonElement.toWireMessage(): WireMessage {
@@ -120,12 +131,15 @@ fun JsonElement.toSessionSummary(): SessionSummary {
     val o = jsonObject
     return SessionSummary(
         sessionId = o["sessionId"]!!.jsonPrimitive.content,
+        source = o["source"]?.jsonPrimitive?.contentOrNull ?: "host",
         title = o["title"]?.jsonPrimitive?.contentOrNull,
+        cwd = o["cwd"]?.jsonPrimitive?.contentOrNull,
         createdAt = o["createdAt"]?.jsonPrimitive?.longOrNull ?: 0L,
-        lastActiveAt = o["lastActiveAt"]?.jsonPrimitive?.longOrNull ?: 0L,
-        lastMessage = o["lastMessage"]?.jsonPrimitive?.contentOrNull,
-        messageCount = o["messageCount"]?.jsonPrimitive?.intOrNull ?: 0,
+        updatedAt = o["updatedAt"]?.jsonPrimitive?.longOrNull ?: 0L,
         live = o["live"]?.jsonPrimitive?.booleanOrNull ?: false,
+        persisted = o["persisted"]?.jsonPrimitive?.booleanOrNull ?: false,
+        messageCount = o["messageCount"]?.jsonPrimitive?.intOrNull,
+        lastMessage = o["lastMessage"]?.jsonPrimitive?.contentOrNull,
         deleted = o["deleted"]?.jsonPrimitive?.booleanOrNull ?: false,
     )
 }
@@ -275,14 +289,62 @@ class DshConnectClient(
     // ── 语义化封装:会话(多轮) ─────────────────────────────────────────────
 
     /**
-     * 新建会话。返回 sessionId —— 之后所有轮次都复用它,agent 才会记得上文。
+     * 新建**或复用**会话。返回 res.data(jsonObject),含 `sessionId` / `source` / `reused`。
+     *
+     * - 传 `sessionId` 且宿主已有 → 复用(resume,上下文延续),`source="host"`
+     * - 传 `sessionId` 但宿主没有 → 用该 id 新建,`source="client"`
+     * - 不传 → 服务端生成 `client-<uuid>`,`source="client"`
+     *
+     * 传 `cwd` 才能让会话归属到对应 workspace(不传落宿主 `_no-cwd` 桶)。
      * 服务端已把本连接自动订阅 `session:<sessionId>`,无需手动 sub。
      */
-    suspend fun createSession(title: String? = null): String {
-        val payload = buildJsonObject { title?.let { put("title", it) } }
+    suspend fun createSession(
+        sessionId: String? = null,
+        title: String? = null,
+        cwd: String? = null,
+    ): JsonObject {
+        val payload = buildJsonObject {
+            sessionId?.let { put("sessionId", it) }
+            title?.let { put("title", it) }
+            cwd?.let { put("cwd", it) }
+        }
         val res = request("session.create", payload)
         checkOk(res, "session.create")
-        return res.data!!.jsonObject["sessionId"]!!.jsonPrimitive.content
+        return res.data!!.jsonObject
+    }
+
+    /** 列出会话(宿主已有 ∪ 本插件),含来源标记。 */
+    suspend fun listSessions(
+        limit: Int = 50,
+        offset: Int = 0,
+        includeDeleted: Boolean = false,
+    ): List<SessionSummary> {
+        val payload = buildJsonObject {
+            put("limit", limit)
+            put("offset", offset)
+            put("includeDeleted", includeDeleted)
+        }
+        val res = request("session.list", payload)
+        checkOk(res, "session.list")
+        return res.data!!.jsonObject["sessions"]!!.jsonArray.map { it.toSessionSummary() }
+    }
+
+    /** 工作区列表;`source` 为 "registry"(复用宿主)或 "cwd"(兜底分组)。 */
+    suspend fun listWorkspaces(): Pair<String, List<WorkspaceView>> {
+        val res = request("workspace.list", buildJsonObject {})
+        checkOk(res, "workspace.list")
+        val root = res.data!!.jsonObject
+        val source = root["source"]?.jsonPrimitive?.content ?: "cwd"
+        val views = root["workspaces"]!!.jsonArray.map { el ->
+            val o = el.jsonObject
+            WorkspaceView(
+                workspaceId = o["workspaceId"]!!.jsonPrimitive.content,
+                path = o["path"]!!.jsonPrimitive.content,
+                title = o["title"]?.jsonPrimitive?.content ?: o["path"]!!.jsonPrimitive.content,
+                sessionIds = o["sessionIds"]?.jsonArray?.map { it.jsonPrimitive.content } ?: emptyList(),
+            )
+        }
+        return source to views
     }
 
     /**
@@ -312,22 +374,6 @@ class DshConnectClient(
         val res = request("session.history", payload)
         checkOk(res, "session.history")
         return res.data!!.jsonObject["messages"]!!.jsonArray.map { it.toWireMessage() }
-    }
-
-    /** 会话列表。includeDeleted=true 可看到软删的(宿主文件仍在)。 */
-    suspend fun listSessions(
-        limit: Int = 50,
-        offset: Int = 0,
-        includeDeleted: Boolean = false,
-    ): List<SessionSummary> {
-        val payload = buildJsonObject {
-            put("limit", limit)
-            put("offset", offset)
-            put("includeDeleted", includeDeleted)
-        }
-        val res = request("session.list", payload)
-        checkOk(res, "session.list")
-        return res.data!!.jsonObject["sessions"]!!.jsonArray.map { it.toSessionSummary() }
     }
 
     /** 软删会话:只是从列表隐藏,宿主会话文件仍保留。 */
@@ -400,23 +446,58 @@ fun handleEvent(frame: Frame) {
     val push = frame.push ?: return
     // push 形如 "task:<taskId>" 或 "session:<sessionId>"
     when (data["kind"]?.jsonPrimitive?.content) {
+        // 生命周期 / 执行结构
         "agent.status"        -> setStatus(push, data["status"]?.jsonPrimitive?.content)
+        "session.turn"        -> setTurnPhase(push, data["turn"]?.jsonPrimitive?.intOrNull,
+                                               data["phase"]?.jsonPrimitive?.content)
+        "session.todo"        -> setTodoList(push, data["todos"])          // 任务清单面板
+        "session.plan"        -> setPlan(push, data["active"]?.jsonPrimitive?.booleanOrNull,
+                                              data["pending"]?.jsonPrimitive?.booleanOrNull)
+        // 思考区
+        "assistant.reasoning"       -> appendReasoning(push, data["text"]?.jsonPrimitive?.content)
+        "assistant.reasoning-chunk" -> appendReasoningChunk(push, data["text"]?.jsonPrimitive?.content) // 仅 chunks=true
+        // 回复
         "session.user-message" -> appendUserText(push, data["text"]?.jsonPrimitive?.content)  // 仅会话主题
-        "assistant.message"   -> appendAssistantText(push, data["text"]?.jsonPrimitive?.content)
-        "assistant.chunk"     -> appendChunk(push, data["chunk"])          // 仅 chunks=true
-        "tool.call"           -> showTool(push, data["name"]?.jsonPrimitive?.content)
-        "tool.result"         -> showToolResult(push, data["ok"]?.jsonPrimitive?.boolean)
-        "agent.error"         -> showError(push, data["message"]?.jsonPrimitive?.content)
-        else -> Unit                                                        // 未知 kind:忽略
+        "assistant.message"    -> appendAssistantText(push, data["text"]?.jsonPrimitive?.content)
+        "assistant.chunk"      -> appendChunk(push, data["chunk"])           // 仅 chunks=true
+        // 工具(label 可直接当标题)
+        "tool.call"    -> showTool(push, data["name"]?.jsonPrimitive?.content,
+                                        data["label"]?.jsonPrimitive?.content,
+                                        data["arguments"]?.jsonPrimitive?.content)
+        "tool.result"  -> showToolResult(push, data["ok"]?.jsonPrimitive?.boolean)
+        "session.approval" -> showApproval(
+            push,
+            data["pendingId"]?.jsonPrimitive?.content,
+            data["toolName"]?.jsonPrimitive?.content,
+            data["reason"]?.jsonPrimitive?.content,
+        )  // 仅会话主题:弹确认框,回 approval.respond
+        "agent.error"  -> showError(push, data["message"]?.jsonPrimitive?.content)
+        else -> Unit                                                          // 未知 kind:忽略
     }
 }
 ```
 
+审批回复(先到先得,超时会被服务端自动拒绝):
+
+```kotlin
+suspend fun respondApproval(sessionId: String, pendingId: String, allow: Boolean) {
+    val res = request("approval.respond", buildJsonObject {
+        put("sessionId", sessionId)
+        put("pendingId", pendingId)
+        put("allow", allow)          // true=本次授予(allowed-once);false=拒绝
+    })
+    // 正常:res.data = { pendingId, outcome }
+    // 未命中(已被别人回复/超时):res.ok=false, code="approval.not.found" —— 忽略即可
+}
+
 要点:
 
 - **未知 `data.kind` 忽略**,服务端会新增事件类型。
-- `session.user-message` 是会话内的用户输入回显 —— 自己发的那条也会收到,可用于多端同步(别把它当重复消息重复渲染,按需去重)。
-- 一次 `session.send` 期间会收到多条 `evt`(状态、工具、若干 assistant 消息),最终以该请求的 `res` 收尾。
+- `assistant.reasoning`(完整)与 `assistant.reasoning-chunk`(流式)是两套:不订阅 chunk 时仍能拿到完整思考。
+- `tool.call.label` 是宿主给的人类可读标题(如 `todo_write` → `Update todo list`);缺失时退回 `name`。
+- `session.user-message` 是会话内的用户输入回显 —— 自己发的那条也会收到,按需与乐观渲染去重。
+- `session.approval` 是**权限请求**:必须弹确认框让用户明示「允许/拒绝」,不要静默放行;回复用 `approval.respond`,先到先得,超时会被服务端自动拒绝。
+- 一次 `session.send` 期间会收到多条 `evt`(状态、思考、工具、若干 assistant 消息),最终以该请求的 `res` 收尾。
 
 ---
 
@@ -452,8 +533,10 @@ client.connect()
 scope.launch {
     client.state.first { it == DshConnectClient.ConnState.OPEN }
 
-    // 1) 建会话,拿到 sessionId(之后每轮都复用它)
-    val sessionId = client.createSession(title = "我的会话")
+    // 1) 新建客户端会话(带 cwd 才能归属到工作区)
+    val created = client.createSession(title = "我的会话", cwd = "/home/me/proj")
+    val sessionId = created["sessionId"]!!.jsonPrimitive.content
+    println("source=${created["source"]?.jsonPrimitive?.content}")   // "client"
 
     // 2) 第一轮
     client.sendMessage(sessionId, "记住:我的代号是「蓝鲸七号」。")
@@ -463,12 +546,17 @@ scope.launch {
     val res = client.sendMessage(sessionId, "我的代号是什么?")
     check(res.ok == true) { "${res.code}: ${res.message}" }
 
-    // 4) 历史
-    client.sessionHistory(sessionId).forEach { println("[${it.role}] ${it.text}") }
+    // 4) 复用宿主已有的会话(用户在 web UI 建的那条)
+    val host = client.listSessions().firstOrNull { it.source == "host" }
+    if (host != null) {
+        val reused = client.createSession(sessionId = host.sessionId)   // 复用
+        println("reused=${reused["reused"]}")                           // true
+    }
 
-    // 5) 列表 / 软删
-    client.listSessions().forEach { println("${it.sessionId} live=${it.live} ${it.title}") }
-    client.deleteSession(sessionId)
+    // 5) 工作区
+    val (source, workspaces) = client.listWorkspaces()
+    println("workspace source=$source")   // "registry" 或 "cwd"
+    workspaces.forEach { println("${it.title} (${it.path}) sessions=${it.sessionIds.size}") }
 }
 ```
 
@@ -501,3 +589,19 @@ scope.launch {
 - [ ] 历史里过滤宿主注入的上下文消息(`<system-reminder>` 等)再渲染
 - [ ] `session.delete` 是**软删**:不要向用户承诺"已彻底删除"(宿主文件仍在)
 - [ ] `session.not.found` / `session.resume-failed` 要有兜底 UI(会话可能已被删或在宿主侧不可用)
+
+**审批 / 权限请求**
+
+- [ ] 收到 `session.approval` 必须**弹确认框**展示 `toolName`/`reason`,让用户明示「允许/拒绝」
+- [ ] 回复用 `approval.respond {sessionId, pendingId, allow}`,`allow=true`=本次授予,`false`=拒绝
+- [ ] 处理 `approval.not.found`(已被别的订阅者回复、或超时)——忽略即可,不要报错崩溃
+- [ ] 宿主**没有「始终允许」**:每次审批都要单独回复,不要做「记住选择」的本地缓存当授权
+
+**镜像 / 工作区 / 思考**
+
+- [ ] `session.list` 是**宿主 ∪ 本插件**:用 `source` 区分来源,不要假设全是自己建的
+- [ ] 建会话时传 `cwd`,否则不会出现在任何 workspace
+- [ ] `workspace.list` 的 `source` 可能是 `cwd`(宿主没装 workspace 插件)——UI 不要写死假设
+- [ ] `assistant.reasoning` 是完整思考、`assistant.reasoning-chunk` 是流式;两者都可能缺失(模型行为),UI 要能空着
+- [ ] `session.todo` 是**整体替换**,不是增量;按整表渲染
+- [ ] `tool.call.label` 可能缺失 → 退回显示 `name`

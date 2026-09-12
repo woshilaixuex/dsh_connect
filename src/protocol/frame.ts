@@ -32,6 +32,7 @@ export const ErrorCodes = {
   SESSION_NOT_FOUND: 'session.not.found',
   SESSION_BUSY: 'session.busy',
   SESSION_RESUME_FAILED: 'session.resume-failed',
+  APPROVAL_NOT_FOUND: 'approval.not.found',
 } as const
 export type ErrorCode = (typeof ErrorCodes)[keyof typeof ErrorCodes]
 

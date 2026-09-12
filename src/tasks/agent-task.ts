@@ -172,10 +172,14 @@ export function registerAgentTask(
     const onSessionEvent = (session: unknown, event: unknown): void => {
       if (task.settled) return
       if (!isRecord(session) || session.id !== task.taskId) return
-      const payload = mapSessionEvent(event as SessionEventLike)
-      if (!payload) return
-      if (payload.kind === 'assistant.chunk' && !task.chunks) return
-      hub.publish(task.channel, payload as unknown as JsonValue)
+      for (const payload of mapSessionEvent(event as SessionEventLike)) {
+        // 流式增量(chunk / reasoning-chunk)仅在客户端要求时转发
+        if ((payload.kind === 'assistant.chunk' || payload.kind === 'assistant.reasoning-chunk') && !task.chunks) {
+          continue
+        }
+        logger.debug?.('task %s publish %s', task.taskId, String(payload.kind))
+        hub.publish(task.channel, payload as unknown as JsonValue)
+      }
     }
     const onAgentStatus = (arg: unknown): void => {
       if (task.settled) return

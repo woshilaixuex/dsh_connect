@@ -75,7 +75,14 @@ let ws: WebSocket | undefined
 
 beforeEach(async () => {
   const ctx = fakeCtx() as Context
-  server = createServer(ctx, { hostName: '127.0.0.1', listenPort: 0, logLevel: LogLevel.DEV })
+  // listenPort/httpPort 都用 0:拿随机端口,避免与正在运行的 dsh 抢端口
+  server = createServer(ctx, {
+    hostName: '127.0.0.1',
+    listenPort: 0,
+    httpPort: 0,
+    logLevel: LogLevel.DEV,
+    sessionIdleTimeoutMs: 60_000,
+  })
   const port = await server.port
   ws = new WebSocket(`ws://127.0.0.1:${port}`)
   await new Promise<void>((resolve, reject) => {
