@@ -432,10 +432,24 @@ export function createSessionRegistry(
       } catch (error) {
         logger.warn('resume session %s failed, falling back to create: %o', sessionId, error)
         handle = await adapter.create(input)
+        try {
+          await persistNewSession(sessionId, handle.agent)
+        } catch (persistError) {
+          await handle.dispose()
+          throw persistError
+        }
         logger.info('session created (after resume failure): %s', sessionId)
       }
     } else {
       handle = await adapter.create(input)
+      // agents.create 只发布 live session；显式 flush 才会让 session-query
+      // 与 PC Web UI 立即看到这个新会话。没有该宿主能力时保留兼容降级。
+      try {
+        await persistNewSession(sessionId, handle.agent)
+      } catch (persistError) {
+        await handle.dispose()
+        throw persistError
+      }
       if (effectiveCwd === undefined) {
         logger.info(
           'session %s has no cwd — it will land in the host "%s" bucket and cannot join any workspace',
@@ -470,6 +484,19 @@ export function createSessionRegistry(
     active.set(sessionId, live)
     logger.debug?.('session live map size=%d', active.size)
     return live
+  }
+
+  async function persistNewSession(sessionId: string, agent: AgentTaskHandle['agent']): Promise<void> {
+    const sessions = ctx.get('sessions') as { flush?: (session: unknown) => Promise<unknown> } | undefined
+    if (typeof sessions?.flush !== 'function' || agent.session === undefined) {
+      logger.warn('session %s created without persistence service/session handle', sessionId)
+      return
+    }
+    const persisted = await sessions.flush.call(sessions, agent.session)
+    if (persisted === false) {
+      throw new Error(`宿主未持久化会话 ${sessionId}`)
+    }
+    logger.info('session persisted: %s', sessionId)
   }
 
   async function release(sessionId: string): Promise<void> {

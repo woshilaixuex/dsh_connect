@@ -28,6 +28,8 @@ export interface HostCtx {
 /** 结构化的宿主 agent 面(只取本插件用到的)。 */
 export interface AgentLike {
   readonly id: string
+  /** 宿主持久化用的 session 对象(由 dsh-agent 提供)。 */
+  readonly session?: unknown
   readonly status?: string
   followup(message: unknown): unknown
   whenIdle(): Promise<void>

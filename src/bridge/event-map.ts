@@ -37,9 +37,18 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 /** 从 content block 数组里拼出纯文本(text 块)。 */
 export function textOf(content: unknown): string | undefined {
+  if (typeof content === 'string') return content
+  if (isRecord(content)) {
+    if (typeof content.text === 'string') return content.text
+    if ('content' in content) return textOf(content.content)
+  }
   if (!Array.isArray(content)) return undefined
   const parts: string[] = []
   for (const block of content) {
+    if (typeof block === 'string') {
+      parts.push(block)
+      continue
+    }
     if (isRecord(block) && block.type === 'text' && typeof block.text === 'string') {
       parts.push(block.text)
     }
@@ -95,6 +104,40 @@ function errorTextOf(content: unknown): string | undefined {
     }
   }
   return parts.length > 0 ? parts.join('; ') : undefined
+}
+
+/** 从工具结果中保留客户端可读的文件/引用元数据,不把整块结构化对象暴露给 UI。 */
+function toolDetailsOf(block: unknown, data: SessionEventLike['data']): Record<string, unknown> | undefined {
+  const sources = [isRecord(block) ? block : undefined, data]
+  const details: Record<string, unknown> = {}
+  const firstString = (...keys: string[]) => {
+    for (const source of sources) {
+      for (const key of keys) {
+        const value = source?.[key]
+        if (typeof value === 'string' && value.length > 0) return value
+      }
+    }
+    return undefined
+  }
+  const fileName = firstString('fileName', 'filename', 'name')
+  const path = firstString('path', 'filePath')
+  const url = firstString('url', 'reference', 'ref', 'address')
+  if (fileName) details.fileName = fileName
+  if (path) details.path = path
+  if (url) details.url = url
+  for (const source of sources) {
+    const attachments = source?.attachments
+    if (Array.isArray(attachments)) {
+      const readable = attachments.filter(isRecord).map((item) => ({
+        ...(typeof item.fileName === 'string' ? { fileName: item.fileName } : {}),
+        ...(typeof item.name === 'string' ? { name: item.name } : {}),
+        ...(typeof item.path === 'string' ? { path: item.path } : {}),
+        ...(typeof item.url === 'string' ? { url: item.url } : {}),
+      }))
+      if (readable.length > 0) details.attachments = readable
+    }
+  }
+  return Object.keys(details).length > 0 ? details : undefined
 }
 
 /** 把宿主 todo 列表规整成线协议形状(丢弃形状不符的项)。 */
@@ -195,6 +238,8 @@ export function mapSessionEvent(event: SessionEventLike): WirePayload[] {
       if (isRecord(error)) {
         payload.error = { name: error.name, code: error.code, message: error.message }
       }
+      const details = toolDetailsOf(block, data)
+      if (details) payload.details = details
       if (typeof turn === 'number') payload.turn = turn
       if (typeof step === 'number') payload.step = step
       return [payload]
