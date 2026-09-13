@@ -1,6 +1,114 @@
 # dsh-connect
 
-A dsh plugin scaffolded by [dsh-dev](https://github.com/dsh-io/dsh-dev).
+> dsh 的局域网连接 plugin：把远程客户端的请求转发给宿主 Agent，并通过 WebSocket 推送执行过程。
+> [LcWhale](https://github.com/woshilaixuex/LcWhale) 是配套的跨端客户端。
+
+## 启动一览（包含 plugin）
+
+### 1. 从 GitHub 安装并注册 plugin
+
+推荐从 GitHub clone 后构建，再让 dsh 注册本地 plugin 目录（仓库的 `lib/` 是编译产物且不提交）：
+
+```powershell
+git clone https://github.com/woshilaixuex/dsh_connect.git
+git clone https://github.com/deepseek-ai/deepseek-harness.git
+cd dsh_connect
+pnpm install
+pnpm build
+cd ..\deepseek-harness
+pnpm install
+pnpm dsh plugin --profile lcwhale add ..\dsh_connect
+```
+
+安装命令会读取本项目 `package.json` 的 `dsh.bundle.patch` 声明，自动将 `dsh-dsh-connect` 注册到 `lcwhale` profile。不要再手动向 profile 的 `cordis.patch.yml` 插入同名 bundle，否则会出现重复 loader。也可以使用 `github:woshilaixuex/dsh_connect`，但前提是安装来源提供已构建的 `lib/`。
+
+### 2. 本地开发模式（可选）
+
+需要修改 plugin 源码时，先 clone 并构建：
+
+```powershell
+git clone https://github.com/woshilaixuex/dsh_connect.git
+cd dsh_connect
+pnpm install
+pnpm build
+```
+
+然后在 deepseek-harness 根目录用本地路径注册：
+
+```powershell
+pnpm dsh plugin --profile lcwhale add ..\dsh_connect
+```
+
+plugin 的入口是 `lib/index.js`，修改 `src/` 后必须重新 `pnpm build`，并重启 dsh。
+
+### 3. 启动 dsh 宿主
+
+plugin 运行在 dsh 进程内，不能直接用 `node lib/index.js` 启动：
+
+```powershell
+pnpm dsh --profile lcwhale
+```
+
+确认日志出现 `ws server listening ...`。默认端口为 WS `8097`、HTTP `8098`；若用 `DSH_CONNECT_PORT` 覆盖 WS 端口，请以实际日志为准。
+
+### 4. 连接 LcWhale
+
+启动 [LcWhale](https://github.com/woshilaixuex/LcWhale) Android App 后输入 `ws://127.0.0.1:8097`。如果 `DSH_CONNECT_PORT` 被覆盖，请使用 dsh 日志显示的实际端口。
+
+USB 调试可先执行 `adb reverse tcp:8097 tcp:8097`；Wi-Fi 调试请改成电脑局域网 IP。端口被环境变量覆盖时同步替换地址。
+
+### 5. 快速检查服务
+
+```powershell
+curl http://127.0.0.1:8098/health
+node scripts/smoke.mjs --no-agent
+node scripts/http-smoke.mjs http://127.0.0.1:8098
+```
+
+## 能力概览
+
+- WebSocket v1：一次性 `agent.run`、多轮 `session.*`、工作区查询、任务停止。
+- 实时事件：思考、回复、流式增量、工具调用、工具结果、待办、计划和 Agent 状态。
+- 审批桥接：将宿主权限请求推送给远程客户端，支持允许一次或拒绝，并有超时兜底。
+- HTTP 只读接口：健康检查、工作区、会话和历史，方便 App、脚本或浏览器调试。
+- 会话镜像与持久化索引：宿主 session 负责事实日志，plugin 负责来源、标题、预览和软删除索引。
+
+## 配置
+
+配置优先级：运行时覆盖 > 进程环境变量 > plugin 根目录 `.env` > `dsh-connect.config.json` > 默认值。
+
+| 变量 | 默认值 | 说明 |
+|---|---:|---|
+| `DSH_CONNECT_HOST` | `0.0.0.0` | WS 监听地址 |
+| `DSH_CONNECT_PORT` | `8097` | WS 端口 |
+| `DSH_CONNECT_HTTP_PORT` | `8098` | HTTP 只读端口，`-1` 禁用 |
+| `DSH_CONNECT_LOG_LEVEL` | `dev` | `dev` / `debug` / `prod` |
+| `DSH_CONNECT_LOG_PATH` | 空 | 日志目录；相对路径基于 `~/.dsh` |
+| `DSH_CONNECT_DB_PATH` | 自动 | SQLite 路径；空串禁用持久化索引 |
+| `DSH_CONNECT_AGENT_PROVIDER` | 宿主默认 | 与 `DSH_CONNECT_AGENT_MODEL` 成对设置 |
+| `DSH_CONNECT_AGENT_MODEL` | 宿主默认 | 远程任务使用的模型 |
+| `DSH_CONNECT_SESSION_IDLE_MS` | `600000` | 会话 Agent 空闲回收时间 |
+| `DSH_CONNECT_APPROVAL_TIMEOUT_MS` | `120000` | 审批等待超时 |
+
+## 开发与测试
+
+```powershell
+pnpm build
+pnpm test
+node scripts/smoke.mjs --no-agent
+node scripts/session-smoke.mjs
+node scripts/http-smoke.mjs
+```
+
+冒烟脚本默认使用 `ws://127.0.0.1:8097` 与 `http://127.0.0.1:8098`，可分别通过 `DSH_CONNECT_SMOKE_URL`、`SESSION_SMOKE_URL`、`DSH_CONNECT_HTTP_SMOKE_URL` 覆盖。
+
+
+## 注意事项
+
+- plugin 必须由 dsh 宿主加载；不要直接运行 `lib/index.js`。
+- `pnpm dsh` 必须在 `deepseek-harness` 根目录执行，并指定已注册 plugin 的 profile，例如 `--profile lcwhale`。
+- 不要在 profile 的 patch 中重复插入 `dsh-dsh-connect`，它已由自身 bundle 注入。
+- 服务默认无鉴权，只建议在可信局域网使用；需要公网部署时请在外层增加认证和 TLS。
 
 ## Develop
 
@@ -176,4 +284,3 @@ dsh-connect 在 `hostName:listenPort`(默认 `0.0.0.0:8097`)提供局域网 WebS
 `workspace.list` 优先复用宿主的 `ctx.workspaceRegistry`,而它**不在 base bundle**里(只在 web-app)。
 要在本 profile 启用,把 `@deepseek-ai/dsh-workspace` 加进 profile 依赖并在 `cordis.patch.yml` 里 insert 一行;
 **未安装时自动回退**为按会话 `cwd` 分组(`source: 'cwd'`),不影响其它能力。
-# dsh_connect
